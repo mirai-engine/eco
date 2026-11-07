@@ -9,22 +9,43 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 )
 
 const usage = `usage: eco COMMAND [flags]
 
-  pair     --addr HOST:PORT                    trust a server (approve the code on the server)
-  serve    --addr HOST:PORT [--pair]           run the server
-  run      --addr HOST:PORT [flags] -- CMD...  run a command, stream its output, mirror its exit code
-  put      --addr HOST:PORT LOCAL REMOTE       upload a file (verified, atomic)
-  get      --addr HOST:PORT REMOTE LOCAL       download a file (resumable, verified)
-  connect  --addr HOST:PORT                    JSON-lines session for programs (concurrent commands)
-  ping     --addr HOST:PORT                    check the connection`
+  pair     --addr HOST:PORT              trust a server (approve the code on the server)
+  serve    --addr HOST:PORT [--pair]     run the server
+
+  run      [flags] -- CMD...             run a command, stream its output, mirror its exit code
+           --wait 50s                    stop waiting after 50s; the command keeps running (exit 254)
+  start    [flags] -- CMD...             start a command in the background and print its job id
+  attach   JOB [--wait D] [--all]        follow a job: output not seen yet, then its exit code
+  jobs     [--json]                      list your jobs on the server
+  kill     JOB                           stop a job and its process tree
+
+  cat      REMOTE                        print a remote file
+  write    REMOTE                        store stdin as a remote file (atomic)
+  put      LOCAL REMOTE                  upload a file (verified, atomic)
+  get      REMOTE LOCAL                  download a file (resumable, verified)
+  forward  [LADDR:]LPORT:HOST:PORT       reach HOST:PORT as seen from the server (like ssh -L)
+
+  connect                                JSON-lines session for programs (concurrent commands)
+  ping                                   check the connection
+
+Every command except serve and pair takes --addr HOST:PORT; it defaults to $ECO_ADDR, or to the
+server if only one is paired.
+run/start flags: --cwd DIR, --env K=V (repeatable), --timeout D, --job ID, --stdin (run only).`
+
+// exitRunning is the exit status when eco stops waiting for a command that is still running.
+const exitRunning = 254
 
 // exitCode is returned by commands that mirror a remote exit status.
 type exitCode int
@@ -59,30 +80,75 @@ func mainErr(args []string) error {
 	dir := f.String("dir", "", "identity and trust directory (default $ECO_HOME or ~/.eco)")
 	pairing := f.Bool("pair", false, "serve: let new clients pair, each approved interactively")
 	label := f.String("name", "", "pair: label shown to the server operator (default hostname)")
-	cwd := f.String("cwd", "", "run: working directory on the server")
-	timeout := f.Duration("timeout", 0, "run: kill the command after this long (0 = no limit)")
+	cwd := f.String("cwd", "", "run/start: working directory on the server")
+	timeout := f.Duration("timeout", 0, "run/start: kill the command after this long (0 = no limit)")
 	withStdin := f.Bool("stdin", false, "run: forward local stdin (the command then cannot survive a disconnect)")
+	wait := f.Duration("wait", 0, "run/attach: stop waiting after this long and leave the command running")
+	jobID := f.String("job", "", "run/start: job id (default: generated)")
+	all := f.Bool("all", false, "attach: replay all retained output, not only what was not seen yet")
+	asJSON := f.Bool("json", false, "jobs: print JSON")
 	var env listFlag
-	f.Var(&env, "env", "run: extra KEY=VALUE for the command (repeatable)")
-	if err := f.Parse(args[1:]); err != nil {
-		return err
+	f.Var(&env, "env", "run/start: extra KEY=VALUE for the command (repeatable)")
+	// For run/start everything from the first positional argument on is the command. Other commands also
+	// accept flags after their arguments (eco attach JOB --wait 30s), up to a "--".
+	var pos []string
+	rest := args[1:]
+	for {
+		if err := f.Parse(rest); err != nil {
+			return err
+		}
+		ended := len(rest)-f.NArg() > 0 && rest[len(rest)-f.NArg()-1] == "--"
+		if f.NArg() == 0 || ended || mode == "run" || mode == "start" {
+			pos = append(pos, f.Args()...)
+			break
+		}
+		pos = append(pos, f.Arg(0))
+		rest = f.Args()[1:]
 	}
 	switch mode {
-	case "pair", "serve", "run", "put", "get", "connect", "ping":
+	case "pair", "serve", "run", "start", "attach", "jobs", "kill", "cat", "write", "put", "get", "forward", "connect", "ping":
 	default:
 		return errors.New(usage)
-	}
-	if *addr == "" {
-		return errors.New("--addr is required")
 	}
 	state, err := stateDir(*dir)
 	if err != nil {
 		return err
 	}
+	if *addr == "" && mode != "pair" && mode != "serve" {
+		if *addr, err = defaultAddr(state); err != nil {
+			return err
+		}
+	}
+	if *addr == "" {
+		return errors.New("--addr is required")
+	}
 	client := &Client{Addr: *addr, Dir: state}
 	defer client.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	nargs := func(n int, shape string) error {
+		if len(pos) != n {
+			return fmt.Errorf("usage: eco %s %s", mode, shape)
+		}
+		return nil
+	}
+	// finish turns a job result into eco's own exit status.
+	finish := func(res ExecResult, err error) error {
+		if res.Running {
+			fmt.Fprintf(os.Stderr, "eco: job %s is still running; follow it with: eco attach %s (or stop it: eco kill %s)\n", res.Job, res.Job, res.Job)
+			return exitCode(exitRunning)
+		}
+		if err != nil {
+			return err
+		}
+		if res.Error != "" {
+			return fmt.Errorf("%s", res.Error)
+		}
+		if res.ExitCode != 0 {
+			return exitCode(max(res.ExitCode, 1))
+		}
+		return nil
+	}
 
 	switch mode {
 	case "pair":
@@ -96,39 +162,140 @@ func mainErr(args []string) error {
 		}
 		fmt.Printf("pong from %s in %s\n", *addr, time.Since(start).Round(100*time.Microsecond))
 		return nil
-	case "run":
-		if f.NArg() == 0 {
-			return errors.New("run: command required after --")
+	case "run", "start":
+		if len(pos) == 0 {
+			return fmt.Errorf("%s: command required after --", mode)
 		}
-		o := ExecOpts{Executable: f.Arg(0), Args: f.Args()[1:], Cwd: *cwd, Env: env, Timeout: *timeout,
-			Stdout: os.Stdout, Stderr: os.Stderr, Durable: true}
+		o := ExecOpts{Executable: pos[0], Args: pos[1:], Cwd: *cwd, Env: env, Timeout: *timeout,
+			Stdout: os.Stdout, Stderr: os.Stderr, Durable: true, Keep: true, JobID: *jobID, Wait: *wait}
+		if mode == "start" {
+			o.Wait, o.DetachOnStart, o.Stdout, o.Stderr = 0, true, nil, nil
+			res, err := client.Exec(ctx, o)
+			if err != nil {
+				return err
+			}
+			if !res.Running { // finished before eco detached
+				fmt.Println(res.Job)
+				return finish(res, nil)
+			}
+			fmt.Println(res.Job)
+			return nil
+		}
 		if *withStdin {
-			o.Stdin = os.Stdin
+			if *wait > 0 {
+				return errors.New("--stdin cannot be combined with --wait")
+			}
+			o.Stdin, o.Keep = os.Stdin, false
 		}
-		res, err := client.Exec(ctx, o)
-		if err != nil && res == (ExecResult{}) {
+		return finish(client.Exec(ctx, o))
+	case "attach":
+		if err := nargs(1, "JOB [--wait D] [--all]"); err != nil {
 			return err
 		}
-		if res.Error != "" {
-			return fmt.Errorf("%s", res.Error)
+		return finish(client.Attach(ctx, AttachOpts{Job: pos[0], All: *all, Wait: *wait, Stdout: os.Stdout, Stderr: os.Stderr}))
+	case "jobs":
+		list, err := client.Jobs()
+		if err != nil {
+			return err
 		}
-		if res.ExitCode != 0 {
-			return exitCode(max(res.ExitCode, 1))
+		if *asJSON {
+			return json.NewEncoder(os.Stdout).Encode(list)
 		}
+		printJobs(os.Stdout, list)
 		return nil
+	case "kill":
+		if err := nargs(1, "JOB"); err != nil {
+			return err
+		}
+		return client.Kill(pos[0])
+	case "cat":
+		if err := nargs(1, "REMOTE"); err != nil {
+			return err
+		}
+		return client.Cat(ctx, pos[0], os.Stdout)
+	case "write":
+		if err := nargs(1, "REMOTE   (content on stdin)"); err != nil {
+			return err
+		}
+		return client.Write(ctx, os.Stdin, pos[0])
 	case "put":
-		if f.NArg() != 2 {
-			return errors.New("usage: eco put --addr HOST:PORT LOCAL REMOTE")
+		if err := nargs(2, "LOCAL REMOTE"); err != nil {
+			return err
 		}
-		return client.Put(ctx, f.Arg(0), f.Arg(1))
+		return client.Put(ctx, pos[0], pos[1])
 	case "get":
-		if f.NArg() != 2 {
-			return errors.New("usage: eco get --addr HOST:PORT REMOTE LOCAL")
+		if err := nargs(2, "REMOTE LOCAL"); err != nil {
+			return err
 		}
-		return client.Get(ctx, f.Arg(0), f.Arg(1))
+		return client.Get(ctx, pos[0], pos[1])
+	case "forward":
+		if err := nargs(1, "[LADDR:]LPORT:HOST:PORT"); err != nil {
+			return err
+		}
+		listen, target, err := parseForward(pos[0])
+		if err != nil {
+			return err
+		}
+		return client.Forward(ctx, listen, target, os.Stderr)
 	default: // connect
 		return connectJSON(ctx, client, os.Stdin, os.Stdout)
 	}
+}
+
+// defaultAddr picks the server when --addr is omitted: $ECO_ADDR, else the only paired server.
+func defaultAddr(state string) (string, error) {
+	if a := os.Getenv("ECO_ADDR"); a != "" {
+		return a, nil
+	}
+	rows, err := readLines(filepath.Join(state, "known_servers"))
+	if err != nil {
+		return "", err
+	}
+	switch len(rows) {
+	case 0:
+		return "", errors.New("no server paired yet: run `eco pair --addr HOST:PORT`")
+	case 1:
+		return rows[0][0], nil
+	}
+	return "", errors.New("several servers are paired: pass --addr HOST:PORT or set ECO_ADDR")
+}
+
+// parseForward reads [LADDR:]LPORT:HOST:PORT. The local side defaults to 127.0.0.1.
+func parseForward(spec string) (listen, target string, err error) {
+	p := strings.Split(spec, ":")
+	switch len(p) {
+	case 3:
+		return net.JoinHostPort("127.0.0.1", p[0]), net.JoinHostPort(p[1], p[2]), nil
+	case 4:
+		return net.JoinHostPort(p[0], p[1]), net.JoinHostPort(p[2], p[3]), nil
+	}
+	return "", "", errors.New("forward: expected [LADDR:]LPORT:HOST:PORT, e.g. 8765:127.0.0.1:8765")
+}
+
+func printJobs(w io.Writer, list []jobInfo) {
+	if len(list) == 0 {
+		fmt.Fprintln(w, "no jobs")
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "JOB\tSTATE\tAGE\tUNREAD\tCOMMAND")
+	for _, j := range list {
+		state := "running"
+		switch {
+		case j.Running && j.Attached:
+			state = "running (attached)"
+		case !j.Running && j.Error != "":
+			state = j.Error
+		case !j.Running:
+			state = fmt.Sprintf("exit %d", j.ExitCode)
+		}
+		cmd := j.Command
+		if len(cmd) > 90 {
+			cmd = cmd[:87] + "..."
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d B\t%s\n", j.ID, state, time.Since(j.Started).Round(time.Second), j.Unread, cmd)
+	}
+	tw.Flush()
 }
 
 func serve(addr, state string, pairing bool) error {
@@ -268,7 +435,7 @@ func connectJSON(ctx context.Context, c *Client, in io.Reader, out io.Writer) er
 				mu.Lock()
 				delete(calls, q.ID)
 				mu.Unlock()
-				if err != nil && res == (ExecResult{}) {
+				if err != nil && res == (ExecResult{Job: res.Job}) {
 					emit(jsonEvent{ID: q.ID, Type: "error", Error: err.Error()})
 					return
 				}

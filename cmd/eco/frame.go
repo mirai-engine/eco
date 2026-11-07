@@ -28,6 +28,7 @@ const (
 	fExit                     // server -> client: JSON exitInfo, ends the stream
 	fError                    // server -> client: JSON {"error"}, ends the stream
 	fMeta                     // server -> client: JSON metaInfo
+	fDetach                   // client -> server: stop the output, leave the job running (answered by fMeta detached)
 )
 
 const (

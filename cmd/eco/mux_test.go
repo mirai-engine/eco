@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -73,6 +74,16 @@ func TestHelperProcess(t *testing.T) {
 			fmt.Printf("line %03d\n", i)
 			time.Sleep(time.Duration(atoi(a[2])) * time.Millisecond)
 		}
+	case "spawn": // spawn MS: start a child that inherits stdout/stderr and sleeps MS, print its pid, exit
+		exe, args := helper("sleep", a[1])
+		c := exec.Command(exe, args...)
+		c.Env = append(os.Environ(), helperEnv()...)
+		c.Stdout, c.Stderr = os.Stdout, os.Stderr
+		if err := c.Start(); err != nil {
+			fmt.Print("spawn failed: ", err)
+			os.Exit(1)
+		}
+		fmt.Printf("child %d\nparent done\n", c.Process.Pid)
 	case "append": // append FILE MS: keeps writing to FILE until killed
 		for {
 			f, _ := os.OpenFile(a[1], os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -549,7 +560,7 @@ func TestRingKeepsRecentOutputAndRejectsExpiredOffsets(t *testing.T) {
 	for i := 0; i < 40; i++ { // nobody attached: output beyond the cap is dropped, never blocks
 		j.write(0, make([]byte, 1<<20))
 	}
-	if err := j.attach(&serverStream{}, [2]int64{0, 0}); err == nil || !strings.Contains(err.Error(), "expired") {
+	if err := j.attach(&serverStream{}, [2]int64{0, 0}, metaInfo{}); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expected expired error, got %v", err)
 	}
 }

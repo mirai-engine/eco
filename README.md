@@ -34,8 +34,10 @@ eco pair --addr SERVER_IP:8443
 
 Both screens show the same verification code, for example `0346-9283`. The code is derived from the TLS
 session and from both identities, so a machine in the middle makes the two codes differ. Compare them and
-answer `y` on the server. The server stores the client fingerprint in `authorized_clients`; the client
-stores the server fingerprint in `known_servers`. From then on no approval is needed.
+approve on the server: answer `y` or `yes` in its terminal (`n` or `no` denies; any other answer asks
+again), or click Yes in the dialog that Windows servers also show. The request
+waits 5 minutes. The server stores the client fingerprint in `authorized_clients`; the client stores the
+server fingerprint in `known_servers`. From then on no approval is needed.
 
 - `--pair` is only needed while adding machines. Without it, unknown clients are refused. Restart the
   server without `--pair` once everything is paired.
@@ -51,20 +53,60 @@ stores the server fingerprint in `known_servers`. From then on no approval is ne
 
 ## Commands
 
+`--addr HOST:PORT` can be omitted when only one server is paired, or set once with `ECO_ADDR`.
+
 ```sh
-eco run  --addr ADDR [--cwd DIR] [--timeout 30s] [--env K=V] [--stdin] -- program args...
-eco put  --addr ADDR LOCAL REMOTE
-eco get  --addr ADDR REMOTE LOCAL
-eco ping --addr ADDR
-eco connect --addr ADDR        # JSON lines for programs, see below
+eco run [--cwd DIR] [--timeout 30s] [--env K=V] [--job ID] [--wait 50s] [--stdin] -- program args...
+eco start [--cwd DIR] [--env K=V] [--job ID] -- program args...   # prints the job id
+eco attach JOB [--wait 50s] [--all]
+eco jobs [--json]
+eco kill JOB
+eco cat REMOTE
+eco write REMOTE < content
+eco put LOCAL REMOTE
+eco get REMOTE LOCAL
+eco forward [LADDR:]LPORT:HOST:PORT
+eco ping
+eco connect                    # JSON lines for programs, see below
 ```
 
 - `run` streams stdout and stderr to the local ones and exits with the remote exit code. Ctrl-C kills the
   remote process tree. Without `--stdin` the command is durable: if the connection drops, `run` reconnects
   and continues where it left off.
+- `run --wait D` stops waiting after D and exits with status **254**, printing the job id; the command
+  keeps running. `start` does the same immediately. `attach JOB` prints the output no client has received
+  yet and then mirrors the exit code (or exits 254 again after `--wait`); `--all` replays all retained
+  output. Ctrl-C on `attach` only detaches; `kill` stops the job and its process tree. `jobs` lists running
+  jobs and finished ones from the last hour.
+- A command is finished when its process exits. Programs it launched in the background (`Start-Process`,
+  `cmd &`, daemons) keep running but no longer hold `run` open, even if they inherited its output.
+- `cat` prints a remote file; `write` stores stdin as a remote file. Both are byte-exact (no shell quoting
+  or encoding in between) and SHA-256 verified; `write` replaces the file atomically.
 - `put` writes to `REMOTE.eco-part` and renames after verifying size and SHA-256, so the destination is never
   half written. `get` verifies the SHA-256 of the whole file and resumes from `LOCAL.eco-part` if a previous
   download was interrupted; a partial that fails verification is discarded.
+- `forward 8765:127.0.0.1:8765` listens on local port 8765 and relays each connection to `127.0.0.1:8765`
+  as seen from the server, so services that only listen on the server's loopback (an MCP server, a dev
+  server, a database) are reachable from the client. Like `ssh -L`.
+
+## Using eco from an agent
+
+Agent harnesses kill tool calls after a time limit. Call eco directly (no wrapper scripts or base64) and
+keep every call under that limit:
+
+```sh
+eco run --wait 50s --cwd 'C:\work\repo' -- powershell -NoProfile -Command 'cargo build'
+# exit 254 means "still running"; continue with:
+eco attach JOB --wait 50s
+```
+
+- Long builds: `eco start -- ...`, then `eco attach JOB --wait 50s` until it exits. No `Start-Process`,
+  log files or process polling needed. If the harness kills eco anyway, the job keeps running and `attach`
+  replays everything it has not confirmed as delivered.
+- Editing remote files: `eco cat PATH` to read, `eco write PATH` with the new content on stdin (a heredoc
+  works), or `eco get` / `eco put` to edit a local copy.
+- Tools that only listen on the server (for example an MCP server on `127.0.0.1`): `eco forward` and point
+  the agent at the local port.
 
 ## Session for programs: `eco connect`
 
@@ -94,10 +136,11 @@ and exits.
   connection drops, the server keeps the process running and buffers up to 16 MiB of output per stream;
   the client reconnects, presents the same job id and the number of bytes it already has, and receives the
   rest exactly once. Presenting a job id again never starts the command a second time, so a retry after an
-  ambiguous failure is safe. Finished jobs stay available for 10 minutes; a running job nobody reattaches
-  to within 10 minutes is killed; a different command under the same job id is refused. If a detached job
-  produces more than 16 MiB of output per stream before the client returns, resuming fails with
-  `output expired`.
+  ambiguous failure is safe. Finished jobs stay available for an hour. Jobs from `run` and `start` keep
+  running with nobody attached until they end; jobs from `connect` are killed if nobody reattaches within
+  10 minutes. A different command under the same job id is refused. If a detached job produces more than
+  16 MiB of output per stream before a client returns, `run` fails to resume with `output expired`, and
+  `attach` continues from the oldest retained byte and says how much was lost.
 - **Stdin.** `--stdin` / `"stdin":true` stream input with flow control. A command with stdin is not
   durable: if the connection drops it is killed, because stdin cannot be replayed.
 - **Cancellation and timeouts.** Cancel and timeout kill the whole process tree (process group on Unix,
@@ -108,13 +151,16 @@ and exits.
 ## Protocol
 
 Frames are `type(1) stream(4) length(4) payload`; control payloads are JSON, data payloads are raw. Client
-to server: `open`, `stdin`, `stdin-eof`, `cancel`, `credit`. Server to client: `out`, `err`, `exit`,
-`error`, `meta`, `credit`. Stream ids increase monotonically per connection. See `cmd/eco/frame.go`.
+to server: `open`, `stdin`, `stdin-eof`, `cancel`, `credit`, `detach`. Server to client: `out`, `err`,
+`exit`, `error`, `meta`, `credit`. Stream ids increase monotonically per connection. See `cmd/eco/frame.go`.
 
 ## Verification
 
 `go test ./...` covers pairing and man-in-the-middle detection, concurrency on one connection, 40 MiB
 output with a slow consumer, a stalled stream not blocking others, cancellation, timeout, stdin, reconnect
-without duplicates or reruns, idempotent job ids, file transfer with resume and corruption detection, and
-the JSON session. The tests run on Windows and were also exercised end to end with the compiled binaries on
-Windows. `go test -race` has not been run (it needs a C compiler).
+without duplicates or reruns, idempotent job ids, commands that leave background children holding their
+output, `--wait` / `start` / `attach` without lost or duplicated output, jobs surviving a killed client,
+`jobs` / `kill`, byte-exact `write` / `cat`, port forwarding (3 MB and concurrent connections), file
+transfer with resume and corruption detection, and the JSON session. The tests run on Windows and were also
+exercised end to end with the compiled binaries on Windows. `go test -race` has not been run (it needs a C
+compiler).

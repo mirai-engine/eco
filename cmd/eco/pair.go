@@ -36,7 +36,7 @@ import (
 
 const (
 	handshakeTimeout = 10 * time.Second
-	approvalTimeout  = 60 * time.Second
+	approvalTimeout  = 5 * time.Minute
 	maxPairFailures  = 5
 	pairLabel        = "eco pairing"
 )
@@ -366,7 +366,7 @@ func (p *pairServer) handle(c net.Conn) {
 	approved = p.approve(pairRequest{Name: cleanLabel(q.Name), Remote: tc.RemoteAddr().String(), Fingerprint: clientFP, Code: code})
 	_ = tc.SetDeadline(time.Now().Add(handshakeTimeout))
 	if !approved {
-		sendErrFrame(tc, id, "pairing denied")
+		sendErrFrame(tc, id, "pairing not approved on the server (denied, or no answer in time)")
 		return
 	}
 	if !authorized {
@@ -403,19 +403,42 @@ func promptApprove(r pairRequest) bool {
 			drained = true
 		}
 	}
-	fmt.Fprintf(os.Stderr, "\nPairing request\n  machine:     %s (%s)\n  fingerprint: %s\n  code:        %s\nDoes the client show the same code? Approve [y/N] (%ds): ",
-		r.Name, r.Remote, r.Fingerprint, r.Code, int(approvalTimeout/time.Second))
-	select {
-	case line, ok := <-stdinLines:
-		if !ok {
-			fmt.Fprintln(os.Stderr, "\nstdin closed; cannot approve")
+	fmt.Fprintf(os.Stderr, "\a\nPairing request\n  machine:     %s (%s)\n  fingerprint: %s\n  code:        %s\n",
+		r.Name, r.Remote, r.Fingerprint, r.Code)
+	start := time.Now()
+	deadline := time.After(approvalTimeout)
+	dialog := approvalDialog(r, approvalTimeout) // a desktop dialog where available; first answer wins
+	defer closeApprovalDialog()
+	for {
+		fmt.Fprintf(os.Stderr, "Does the client show the same code? Approve [y/n] (%s left): ", (approvalTimeout - time.Since(start)).Round(time.Second))
+		select {
+		case line, ok := <-stdinLines:
+			if !ok {
+				fmt.Fprintln(os.Stderr, "\nstdin closed; answer in the dialog")
+				stdinLines = nil
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(line)) {
+			case "y", "yes":
+				fmt.Fprintln(os.Stderr, "approved")
+				return true
+			case "n", "no":
+				fmt.Fprintln(os.Stderr, "denied")
+				return false
+			default: // a typo must not deny the request; ask again
+				fmt.Fprintln(os.Stderr, "please answer y or n")
+			}
+		case ok := <-dialog:
+			if ok {
+				fmt.Fprintln(os.Stderr, "\napproved in the dialog")
+			} else {
+				fmt.Fprintln(os.Stderr, "\ndenied in the dialog")
+			}
+			return ok
+		case <-deadline:
+			fmt.Fprintln(os.Stderr, "\nno answer in time; request expired")
 			return false
 		}
-		a := strings.ToLower(strings.TrimSpace(line))
-		return a == "y" || a == "yes" || a == "s" || a == "si"
-	case <-time.After(approvalTimeout):
-		fmt.Fprintln(os.Stderr, "\ntimed out")
-		return false
 	}
 }
 
@@ -439,7 +462,7 @@ func pairWith(addr, dir, label string, status io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(status, "Verification code: %s\nServer fingerprint: %s\nCheck that the server shows the same code, then approve there (%ds)...\n", code, srvFP, int(approvalTimeout/time.Second))
+	fmt.Fprintf(status, "Verification code: %s\nServer fingerprint: %s\nCheck that the server shows the same code, then approve there (within %s)...\n", code, srvFP, approvalTimeout)
 	if label == "" {
 		label, _ = os.Hostname()
 	}

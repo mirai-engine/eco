@@ -256,12 +256,25 @@ type ExecOpts struct {
 	Stderr     io.Writer
 	Durable    bool   // survive disconnects: reconnect and resume, never running the command twice
 	JobID      string // idempotency key for Durable calls (generated when empty)
-	OnStart    func()
+	Keep       bool   // Durable: keep running while no client is attached (otherwise killed after a grace period)
+	// Wait > 0 stops waiting after that long: the result has Running set and the job keeps running on the
+	// server (requires Durable and Keep). Continue with Attach.
+	Wait          time.Duration
+	DetachOnStart bool // return as soon as the command has started (like Wait, but immediately)
+	OnStart       func()
 }
 
 type ExecResult struct {
 	ExitCode int
 	Error    string // "canceled", "timeout", ... when the command was stopped rather than finished
+	Running  bool   // the client stopped waiting (Wait / DetachOnStart); the job is still running
+	Job      string // job id, for Attach / Kill
+}
+
+// detachPlan says when drain stops waiting without ending the job.
+type detachPlan struct {
+	at      time.Time // zero: never
+	onStart bool
 }
 
 // Exec runs a command remotely. Context cancellation kills the remote process tree.
@@ -269,10 +282,48 @@ func (c *Client) Exec(ctx context.Context, o ExecOpts) (ExecResult, error) {
 	job := ""
 	if o.Durable && o.Stdin == nil {
 		if job = o.JobID; job == "" {
-			job = randomID()
+			job = shortID()
 		}
 	}
-	out, errw := o.Stdout, o.Stderr
+	if (o.Wait > 0 || o.DetachOnStart) && (job == "" || !o.Keep) {
+		return ExecResult{}, errors.New("wait/detach needs a durable job with Keep and without stdin")
+	}
+	plan := detachPlan{onStart: o.DetachOnStart}
+	if o.Wait > 0 {
+		plan.at = time.Now().Add(o.Wait)
+	}
+	return c.follow(ctx, job, o.Stdout, o.Stderr, plan, true, o.OnStart, func(nOut, nErr int64, first bool) openReq {
+		return openReq{Method: "exec", Job: job, Executable: o.Executable, Args: o.Args, Cwd: o.Cwd, Env: o.Env,
+			TimeoutMS: int(o.Timeout / time.Millisecond), Stdin: o.Stdin != nil, Keep: o.Keep, OutOffset: nOut, ErrOffset: nErr}
+	}, o.Stdin)
+}
+
+type AttachOpts struct {
+	Job            string
+	All            bool          // replay all retained output instead of only what was not delivered yet
+	Wait           time.Duration // > 0: stop waiting after this long (the job keeps running)
+	Stdout, Stderr io.Writer
+}
+
+// Attach follows the output of a job started earlier (by Exec with Keep, `eco start` or `eco run --wait`)
+// until it ends or Wait elapses. Cancelling the context detaches; it never kills the job (use Kill).
+func (c *Client) Attach(ctx context.Context, o AttachOpts) (ExecResult, error) {
+	plan := detachPlan{}
+	if o.Wait > 0 {
+		plan.at = time.Now().Add(o.Wait)
+	}
+	return c.follow(ctx, o.Job, o.Stdout, o.Stderr, plan, false, nil, func(nOut, nErr int64, first bool) openReq {
+		if first {
+			return openReq{Method: "attach", Job: o.Job, Resume: !o.All, All: o.All}
+		}
+		return openReq{Method: "attach", Job: o.Job, OutOffset: nOut, ErrOffset: nErr}
+	}, nil)
+}
+
+// follow opens a stream built by mkReq and copies its output, reconnecting (with the offsets received so
+// far) while the connection drops, as long as the call has a job id.
+func (c *Client) follow(ctx context.Context, job string, out, errw io.Writer, plan detachPlan, cancelKills bool,
+	onStart func(), mkReq func(nOut, nErr int64, first bool) openReq, stdin io.Reader) (ExecResult, error) {
 	if out == nil {
 		out = io.Discard
 	}
@@ -281,32 +332,38 @@ func (c *Client) Exec(ctx context.Context, o ExecOpts) (ExecResult, error) {
 	}
 	var nOut, nErr int64
 	var lostSince time.Time
-	started := false
+	started, first := false, true
 	backoff := 100 * time.Millisecond
-	for attempt := 0; ; attempt++ {
-		req := openReq{Method: "exec", Job: job, Executable: o.Executable, Args: o.Args, Cwd: o.Cwd, Env: o.Env,
-			TimeoutMS: int(o.Timeout / time.Millisecond), Stdin: o.Stdin != nil, OutOffset: nOut, ErrOffset: nErr}
-		s, err := c.open(req)
+	for {
+		s, err := c.open(mkReq(nOut, nErr, first))
 		if err == nil {
-			if o.Stdin != nil {
-				go pumpStdin(s, o.Stdin)
+			if stdin != nil {
+				go pumpStdin(s, stdin)
 			}
 			var res ExecResult
-			res, err = drain(ctx, s, &nOut, &nErr, out, errw, func() {
+			res, err = drain(ctx, s, &nOut, &nErr, out, errw, plan, cancelKills, func() {
+				first = false
 				if !started {
 					started = true
-					if o.OnStart != nil {
-						o.OnStart()
+					if onStart != nil {
+						onStart()
 					}
 				}
 			})
 			s.release()
 			if err == nil {
+				res.Job = job
+				if res.Running {
+					return res, nil
+				}
+				if !cancelKills && ctx.Err() != nil { // attach interrupted: detached, the job goes on
+					return ExecResult{Running: true, Job: job}, nil
+				}
 				return res, ctx.Err()
 			}
 		}
 		if job == "" || !isTransient(err) {
-			return ExecResult{}, err
+			return ExecResult{Job: job}, err
 		}
 		if lostSince.IsZero() {
 			lostSince = time.Now()
@@ -349,10 +406,31 @@ func pumpStdin(s *clientStream, r io.Reader) {
 	}
 }
 
-// drain copies a stream's output until the exit status arrives.
-func drain(ctx context.Context, s *clientStream, nOut, nErr *int64, out, errw io.Writer, onStart func()) (ExecResult, error) {
-	stop := context.AfterFunc(ctx, func() { _ = s.cc.send(fCancel, s.id, nil) })
+// drain copies a stream's output until the exit status arrives, or until the client detaches (plan, or a
+// cancelled context when cancelKills is false), which leaves the job running.
+func drain(ctx context.Context, s *clientStream, nOut, nErr *int64, out, errw io.Writer, plan detachPlan, cancelKills bool, onStart func()) (ExecResult, error) {
+	var mu sync.Mutex
+	started, want, sent := false, false, false
+	detach := func() { // only once the job is attached on the server, i.e. after the start meta
+		mu.Lock()
+		defer mu.Unlock()
+		want = true
+		if started && !sent {
+			sent = true
+			_ = s.cc.send(fDetach, s.id, nil)
+		}
+	}
+	var stop func() bool
+	if cancelKills {
+		stop = context.AfterFunc(ctx, func() { _ = s.cc.send(fCancel, s.id, nil) })
+	} else {
+		stop = context.AfterFunc(ctx, detach)
+	}
 	defer stop()
+	if !plan.at.IsZero() {
+		t := time.AfterFunc(time.Until(plan.at), detach)
+		defer t.Stop()
+	}
 	for {
 		f, err := s.recv()
 		if err != nil {
@@ -360,7 +438,31 @@ func drain(ctx context.Context, s *clientStream, nOut, nErr *int64, out, errw io
 		}
 		switch f.typ {
 		case fMeta:
-			onStart()
+			var m metaInfo
+			_ = json.Unmarshal(f.payload, &m)
+			if m.Detached {
+				return ExecResult{Running: true}, nil
+			}
+			if m.Started {
+				*nOut, *nErr = m.Offsets[0], m.Offsets[1]
+				if m.Dropped > 0 {
+					fmt.Fprintf(errw, "[eco: %d bytes of earlier output were no longer retained]\n", m.Dropped)
+				}
+				onStart()
+				mu.Lock()
+				started = true
+				mu.Unlock()
+				if plan.onStart {
+					detach()
+				} else {
+					mu.Lock()
+					w := want
+					mu.Unlock()
+					if w {
+						detach()
+					}
+				}
+			}
 		case fOut:
 			if _, err := out.Write(f.payload); err != nil {
 				return ExecResult{}, err
@@ -393,7 +495,17 @@ func (c *Client) Put(ctx context.Context, local, remote string) error {
 		return err
 	}
 	size := st.Size()
-	s, err := c.open(openReq{Method: "put", Path: remote, Mode: uint32(st.Mode().Perm()), Size: &size})
+	return c.putFrom(ctx, f, &size, uint32(st.Mode().Perm()), remote)
+}
+
+// Write stores everything read from r as the remote file (atomic, SHA-256 verified). The size need not be
+// known in advance, so r can be stdin.
+func (c *Client) Write(ctx context.Context, r io.Reader, remote string) error {
+	return c.putFrom(ctx, r, nil, 0644, remote)
+}
+
+func (c *Client) putFrom(ctx context.Context, f io.Reader, size *int64, mode uint32, remote string) error {
+	s, err := c.open(openReq{Method: "put", Path: remote, Mode: mode, Size: size})
 	if err != nil {
 		return err
 	}
@@ -506,6 +618,160 @@ func (c *Client) Get(ctx context.Context, remote, local string) error {
 		}
 	}
 }
+
+// Cat writes a remote file to w and verifies its SHA-256 (reported as an error after the data was written).
+func (c *Client) Cat(ctx context.Context, remote string, w io.Writer) error {
+	s, err := c.open(openReq{Method: "get", Path: remote})
+	if err != nil {
+		return err
+	}
+	defer s.release()
+	stop := context.AfterFunc(ctx, func() { _ = s.cc.send(fCancel, s.id, nil) })
+	defer stop()
+	h := sha256.New()
+	for {
+		fr, err := s.recv()
+		if err != nil {
+			return err
+		}
+		switch fr.typ {
+		case fOut:
+			h.Write(fr.payload)
+			if _, err := w.Write(fr.payload); err != nil {
+				_ = s.cc.send(fCancel, s.id, nil)
+				return err
+			}
+		case fError:
+			return decodeErr(fr)
+		case fExit:
+			var e exitInfo
+			_ = json.Unmarshal(fr.payload, &e)
+			if e.SHA256 != "" && hex.EncodeToString(h.Sum(nil)) != e.SHA256 {
+				return errors.New("checksum mismatch")
+			}
+			return ctx.Err()
+		}
+	}
+}
+
+// call runs a request that answers with optional data frames and an exit, returning the data.
+func (c *Client) call(req openReq) ([]byte, error) {
+	s, err := c.open(req)
+	if err != nil {
+		return nil, err
+	}
+	defer s.release()
+	var out []byte
+	for {
+		f, err := s.recv()
+		if err != nil {
+			return nil, err
+		}
+		switch f.typ {
+		case fOut:
+			out = append(out, f.payload...)
+		case fError:
+			return nil, decodeErr(f)
+		case fExit:
+			return out, nil
+		}
+	}
+}
+
+// Jobs lists the jobs this client has on the server (running, and finished ones still retained).
+func (c *Client) Jobs() ([]jobInfo, error) {
+	b, err := c.call(openReq{Method: "jobs"})
+	if err != nil {
+		return nil, err
+	}
+	var list []jobInfo
+	return list, json.Unmarshal(b, &list)
+}
+
+// Kill stops a job and its whole process tree.
+func (c *Client) Kill(id string) error {
+	_, err := c.call(openReq{Method: "kill", Job: id})
+	return err
+}
+
+// Forward listens on listen and relays every connection to target, a host:port reachable from the server
+// (like ssh -L). It returns when ctx is cancelled.
+func (c *Client) Forward(ctx context.Context, listen, target string, logw io.Writer) error {
+	l, err := net.Listen("tcp", listen)
+	if err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { l.Close() })
+	defer stop()
+	fmt.Fprintf(logw, "forwarding %s -> %s (on the server)\n", l.Addr(), target)
+	for {
+		lc, err := l.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		go func() {
+			if err := c.forwardConn(lc, target); err != nil {
+				fmt.Fprintf(logw, "forward %s: %v\n", target, err)
+			}
+		}()
+	}
+}
+
+func (c *Client) forwardConn(lc net.Conn, target string) error {
+	defer lc.Close()
+	s, err := c.open(openReq{Method: "dial", Target: target})
+	if err != nil {
+		return err
+	}
+	defer s.release()
+	f, err := s.recv()
+	if err != nil {
+		return err
+	}
+	if f.typ == fError {
+		return decodeErr(f)
+	}
+	go func() { // local -> server
+		buf := make([]byte, chunkSize)
+		for {
+			n, rerr := lc.Read(buf)
+			if n > 0 && s.sendData(buf[:n]) != nil {
+				return
+			}
+			if rerr == io.EOF {
+				_ = s.cc.send(fStdinEOF, s.id, nil)
+				return
+			}
+			if rerr != nil {
+				_ = s.cc.send(fCancel, s.id, nil)
+				return
+			}
+		}
+	}()
+	for { // server -> local
+		f, err := s.recv()
+		if err != nil {
+			return err
+		}
+		switch f.typ {
+		case fOut:
+			if _, err := lc.Write(f.payload); err != nil {
+				_ = s.cc.send(fCancel, s.id, nil)
+				return nil
+			}
+		case fExit:
+			return nil
+		case fError:
+			return decodeErr(f)
+		}
+	}
+}
+
+// shortID is a job id that is easy to type: 8 hex digits.
+func shortID() string { return randomID()[:8] }
 
 func fileSHA256(path string) (string, error) {
 	f, err := os.Open(path)

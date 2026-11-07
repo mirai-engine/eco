@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,12 +25,13 @@ const (
 	maxTimeout     = 24 * time.Hour
 )
 
-// openReq starts a stream. Method is one of exec, put, get, ping (pair is handled before the mux).
+// openReq starts a stream. Method is one of exec, attach, jobs, kill, put, get, dial, ping (pair is handled
+// before the mux).
 type openReq struct {
 	Method string `json:"method"`
 	Name   string `json:"name,omitempty"` // pair: label of the client
 
-	// exec
+	// exec / attach / kill
 	Job        string   `json:"job,omitempty"` // client-chosen idempotency key; makes the job survive disconnects
 	Executable string   `json:"executable,omitempty"`
 	Args       []string `json:"args,omitempty"`
@@ -37,14 +39,20 @@ type openReq struct {
 	Env        []string `json:"env,omitempty"` // extra KEY=VALUE entries
 	TimeoutMS  int      `json:"timeout_ms,omitempty"`
 	Stdin      bool     `json:"stdin,omitempty"`
+	Keep       bool     `json:"keep,omitempty"`       // keep running while no client is attached, until it ends
 	OutOffset  int64    `json:"out_offset,omitempty"` // bytes of stdout the client already has
 	ErrOffset  int64    `json:"err_offset,omitempty"`
+	Resume     bool     `json:"resume,omitempty"` // attach: continue after the output already delivered
+	All        bool     `json:"all,omitempty"`    // attach: replay all retained output
 
 	// put / get
 	Path   string `json:"path,omitempty"`
 	Mode   uint32 `json:"mode,omitempty"`
 	Size   *int64 `json:"size,omitempty"`   // put: expected size
 	Offset int64  `json:"offset,omitempty"` // get: resume position
+
+	// dial
+	Target string `json:"target,omitempty"` // host:port reachable from the server
 }
 
 type exitInfo struct {
@@ -55,10 +63,28 @@ type exitInfo struct {
 }
 
 type metaInfo struct {
-	Started bool   `json:"started,omitempty"`
-	Job     string `json:"job,omitempty"`
-	Size    int64  `json:"size,omitempty"`
-	Mode    uint32 `json:"mode,omitempty"`
+	Started   bool     `json:"started,omitempty"`
+	Job       string   `json:"job,omitempty"`
+	Size      int64    `json:"size,omitempty"`
+	Mode      uint32   `json:"mode,omitempty"`
+	Offsets   [2]int64 `json:"offsets,omitempty"` // attach: absolute stdout/stderr offsets output resumes at
+	Dropped   int64    `json:"dropped,omitempty"` // attach: bytes that were no longer retained
+	Detached  bool     `json:"detached,omitempty"`
+	Delivered [2]int64 `json:"delivered,omitempty"` // detached: offsets the client has received
+}
+
+// jobInfo describes a retained job for `eco jobs`.
+type jobInfo struct {
+	ID       string    `json:"id"`
+	Command  string    `json:"command"`
+	Cwd      string    `json:"cwd,omitempty"`
+	Running  bool      `json:"running"`
+	Attached bool      `json:"attached"`
+	ExitCode int       `json:"exit_code"`
+	Error    string    `json:"error,omitempty"`
+	Started  time.Time `json:"started"`
+	Ended    time.Time `json:"ended,omitzero"`
+	Unread   int64     `json:"unread"` // output bytes not yet delivered to any client
 }
 
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
@@ -122,6 +148,7 @@ type attachment struct {
 	s      *serverStream
 	next   [2]int64
 	closed bool
+	done   chan struct{} // closed when the pump goroutine returns
 }
 
 type job struct {
@@ -131,25 +158,30 @@ type job struct {
 	req     openReq
 	ready   chan struct{}
 	startEr error
+	begin   time.Time
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	rings   [2]*ring // 0 stdout, 1 stderr
-	sent    [2]int64
-	att     *attachment
-	done    bool
-	exit    exitInfo
-	end     time.Time
-	killed  string
-	started bool
-	cmd     *exec.Cmd
-	stdinW  io.WriteCloser
-	grace   *time.Timer
-	timeout *time.Timer
+	busy   atomic.Int32 // output readers currently storing data
+	lastIO atomic.Int64 // unix nanoseconds of the last output read
+
+	mu        sync.Mutex
+	cond      *sync.Cond
+	rings     [2]*ring // 0 stdout, 1 stderr
+	sent      [2]int64
+	delivered [2]int64 // output confirmed received by a client (where `eco attach` resumes)
+	att       *attachment
+	done      bool
+	exit      exitInfo
+	end       time.Time
+	killed    string
+	started   bool
+	cmd       *exec.Cmd
+	stdinW    io.WriteCloser
+	grace     *time.Timer
+	timeout   *time.Timer
 }
 
 func newJob(m *muxServer, key string, req openReq) *job {
-	j := &job{m: m, key: key, durable: req.Job != "", req: req, ready: make(chan struct{})}
+	j := &job{m: m, key: key, durable: req.Job != "", req: req, ready: make(chan struct{}), begin: time.Now()}
 	j.cond = sync.NewCond(&j.mu)
 	j.rings = [2]*ring{{cap: ringCap}, {cap: ringCap}}
 	return j
@@ -187,9 +219,14 @@ func (j *job) kill(reason string) {
 	}
 }
 
-func (j *job) run(stdout, stderr io.Reader) {
+// run collects the output and the exit status. The command counts as finished when its process exits:
+// programs it started in the background (Start-Process, `cmd &`, daemons) may inherit the output pipes
+// and keep them open for hours, so after the exit the pipes are drained only until they go quiet for
+// outputGrace and are then closed.
+func (j *job) run(stdout, stderr *os.File) {
+	readers := make(chan struct{})
 	var wg sync.WaitGroup
-	for i, r := range []io.Reader{stdout, stderr} {
+	for i, r := range []*os.File{stdout, stderr} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -197,7 +234,10 @@ func (j *job) run(stdout, stderr io.Reader) {
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
+					j.busy.Add(1)
 					j.write(i, buf[:n])
+					j.lastIO.Store(time.Now().UnixNano())
+					j.busy.Add(-1)
 				}
 				if err != nil {
 					return
@@ -205,8 +245,29 @@ func (j *job) run(stdout, stderr io.Reader) {
 			}
 		}()
 	}
-	wg.Wait()
-	err := j.cmd.Wait()
+	go func() { wg.Wait(); close(readers) }()
+	err := j.cmd.Wait() // Stdout/Stderr are *os.File, so this returns as soon as the process exits
+	exited := time.Now()
+	j.lastIO.Store(exited.UnixNano())
+	tick := time.NewTicker(min(j.m.outputGrace/4, 100*time.Millisecond))
+drain:
+	for {
+		select {
+		case <-readers:
+			break drain
+		case <-tick.C:
+			// Output still being stored (a slow client applying backpressure) is never cut. Otherwise stop when
+			// the pipes are quiet, or after a few grace periods if a background process keeps writing to them.
+			quiet := time.Since(time.Unix(0, j.lastIO.Load())) >= j.m.outputGrace
+			if j.busy.Load() == 0 && (quiet || time.Since(exited) >= 5*j.m.outputGrace) {
+				break drain
+			}
+		}
+	}
+	tick.Stop()
+	stdout.Close() // unblocks readers still waiting on pipes held open by background processes
+	stderr.Close()
+	<-readers
 	e := exitInfo{ExitCode: j.cmd.ProcessState.ExitCode()}
 	var ee *exec.ExitError
 	if err != nil && !errors.As(err, &ee) {
@@ -228,7 +289,8 @@ func (j *job) run(stdout, stderr io.Reader) {
 }
 
 // attach binds a stream to the job and starts replaying output from the client's offsets.
-func (j *job) attach(s *serverStream, off [2]int64) error {
+func (j *job) attach(s *serverStream, off [2]int64, meta metaInfo) error {
+	meta.Started, meta.Offsets = true, off
 	j.mu.Lock()
 	for i := 0; i < 2; i++ {
 		if off[i] < j.rings[i].start {
@@ -244,9 +306,10 @@ func (j *job) attach(s *serverStream, off [2]int64) error {
 	if old != nil {
 		old.closed = true
 	}
-	att := &attachment{s: s, next: off}
+	att := &attachment{s: s, next: off, done: make(chan struct{})}
 	j.att = att
 	j.sent = off
+	j.delivered = off
 	if j.grace != nil {
 		j.grace.Stop()
 		j.grace = nil
@@ -259,6 +322,8 @@ func (j *job) attach(s *serverStream, off [2]int64) error {
 	s.mu.Lock()
 	s.job, s.att = j, att
 	s.mu.Unlock()
+	// The start meta carries the offsets output resumes at, so it must precede the first output frame.
+	_ = s.c.send(fMeta, s.id, mustJSON(meta))
 	go j.pump(att)
 	return nil
 }
@@ -271,7 +336,7 @@ func (j *job) detach(att *attachment) {
 	att.closed = true
 	if j.att == att {
 		j.att = nil
-		if !j.done && j.durable && j.grace == nil {
+		if !j.done && j.durable && !j.req.Keep && j.grace == nil {
 			j.grace = time.AfterFunc(j.m.detachGrace, func() { j.kill("no client reattached in time") })
 		}
 	}
@@ -279,8 +344,29 @@ func (j *job) detach(att *attachment) {
 	j.mu.Unlock()
 }
 
+// detachClean ends an attachment at the client's request: the pump is stopped first, so the offsets it
+// reports are exactly what was sent before the reply, and the next `eco attach` continues from there.
+func (j *job) detachClean(s *serverStream, att *attachment) {
+	j.mu.Lock()
+	att.closed = true
+	j.cond.Broadcast()
+	j.mu.Unlock()
+	s.out.close() // wakes a pump waiting for credit
+	<-att.done
+	j.mu.Lock()
+	delivered := att.next
+	if j.att == att {
+		j.delivered = delivered
+	}
+	j.mu.Unlock()
+	j.detach(att)
+	_ = s.c.send(fMeta, s.id, mustJSON(metaInfo{Detached: true, Delivered: delivered}))
+	s.c.remove(s.id)
+}
+
 // pump streams ring contents and finally the exit status to the attached stream.
 func (j *job) pump(att *attachment) {
+	defer close(att.done)
 	s := att.s
 	for {
 		j.mu.Lock()
@@ -301,6 +387,9 @@ func (j *job) pump(att *attachment) {
 			}
 			if j.done {
 				e := j.exit
+				if j.att == att {
+					j.delivered = att.next
+				}
 				j.mu.Unlock()
 				_ = s.c.send(fExit, s.id, mustJSON(e))
 				s.c.remove(s.id)
@@ -347,13 +436,15 @@ type muxServer struct {
 	mu          sync.Mutex
 	jobs        map[string]*job
 	perPeer     map[string]int
-	detachGrace time.Duration // kill a durable job nobody reattaches to
+	detachGrace time.Duration // kill a durable job (without Keep) nobody reattaches to
 	retain      time.Duration // how long finished jobs stay available for reattaching
+	outputGrace time.Duration // after the process exits, how long quiet pipes are still drained
 	stop        chan struct{}
 }
 
 func newMuxServer() *muxServer {
-	m := &muxServer{jobs: map[string]*job{}, perPeer: map[string]int{}, detachGrace: 10 * time.Minute, retain: 10 * time.Minute, stop: make(chan struct{})}
+	m := &muxServer{jobs: map[string]*job{}, perPeer: map[string]int{}, detachGrace: 10 * time.Minute,
+		retain: time.Hour, outputGrace: 500 * time.Millisecond, stop: make(chan struct{})}
 	go m.janitor()
 	return m
 }
@@ -473,6 +564,15 @@ func (m *muxServer) serveConn(conn net.Conn, r io.Reader, fp string, first *fram
 			if s != nil && len(f.payload) == 4 {
 				s.out.add(int64(binary.BigEndian.Uint32(f.payload)))
 			}
+		case fDetach:
+			if s != nil {
+				s.mu.Lock()
+				j, att := s.job, s.att
+				s.mu.Unlock()
+				if j != nil && att != nil {
+					go j.detachClean(s, att)
+				}
+			}
 		default:
 			return
 		}
@@ -530,11 +630,20 @@ func (c *serverConn) open(f frame) {
 			s.stdin = newFrameQueue()
 		}
 		go c.execStream(s, req)
+	case "attach":
+		go c.attachStream(s, req)
+	case "jobs":
+		go c.jobsStream(s)
+	case "kill":
+		go c.killStream(s, req)
 	case "put":
 		s.stdin = newFrameQueue()
 		go c.putStream(s, req)
 	case "get":
 		go c.getStream(s, req)
+	case "dial":
+		s.stdin = newFrameQueue()
+		go c.dialStream(s, req)
 	default:
 		c.fail(s, "unknown method")
 	}
@@ -570,14 +679,166 @@ func (c *serverConn) execStream(s *serverStream, req openReq) {
 	if req.Stdin {
 		go c.stdinLoop(s, j)
 	}
-	if err := j.attach(s, [2]int64{req.OutOffset, req.ErrOffset}); err != nil {
+	if err := j.attach(s, [2]int64{req.OutOffset, req.ErrOffset}, metaInfo{Job: req.Job}); err != nil {
 		if fresh && !j.durable {
 			j.kill("canceled")
 		}
 		c.fail(s, err.Error())
+	}
+}
+
+// lookup returns a retained job of this client.
+func (c *serverConn) lookup(id string) *job {
+	c.m.mu.Lock()
+	defer c.m.mu.Unlock()
+	return c.m.jobs[c.fp+"|"+id]
+}
+
+// attachStream streams the output of an existing job: by default only what no client has received yet.
+func (c *serverConn) attachStream(s *serverStream, req openReq) {
+	j := c.lookup(req.Job)
+	if req.Job == "" || j == nil {
+		c.fail(s, "no such job: "+req.Job+" (see `eco jobs`)")
 		return
 	}
-	_ = c.send(fMeta, s.id, mustJSON(metaInfo{Started: true, Job: req.Job}))
+	<-j.ready
+	if j.startEr != nil {
+		c.fail(s, j.startEr.Error())
+		return
+	}
+	j.mu.Lock()
+	off := [2]int64{req.OutOffset, req.ErrOffset}
+	switch {
+	case req.All:
+		off = [2]int64{j.rings[0].start, j.rings[1].start}
+	case req.Resume:
+		off = j.delivered
+	}
+	var dropped int64
+	for i := range off {
+		if off[i] < j.rings[i].start {
+			dropped += j.rings[i].start - off[i]
+			off[i] = j.rings[i].start
+		}
+	}
+	j.mu.Unlock()
+	s.mu.Lock()
+	s.cancel = func() { j.kill("canceled") }
+	s.mu.Unlock()
+	if err := j.attach(s, off, metaInfo{Job: req.Job, Dropped: dropped}); err != nil {
+		c.fail(s, err.Error())
+	}
+}
+
+func (c *serverConn) jobsStream(s *serverStream) {
+	c.m.mu.Lock()
+	var list []jobInfo
+	for key, j := range c.m.jobs {
+		if key[:len(key)-len(j.req.Job)-1] != c.fp {
+			continue
+		}
+		j.mu.Lock()
+		cmd := strings.Join(append([]string{j.req.Executable}, j.req.Args...), " ")
+		if len(cmd) > 300 {
+			cmd = cmd[:300] + "..."
+		}
+		list = append(list, jobInfo{ID: j.req.Job, Command: cmd, Cwd: j.req.Cwd, Running: !j.done && j.startEr == nil,
+			Attached: j.att != nil, ExitCode: j.exit.ExitCode, Error: j.exit.Error, Started: j.begin, Ended: j.end,
+			Unread: (j.rings[0].end - j.delivered[0]) + (j.rings[1].end - j.delivered[1])})
+		j.mu.Unlock()
+	}
+	c.m.mu.Unlock()
+	sort.Slice(list, func(a, b int) bool { return list[a].Started.Before(list[b].Started) })
+	for len(list) > 0 { // keep the reply within one frame
+		b := mustJSON(list)
+		if len(b) <= maxFrame {
+			_ = c.send(fOut, s.id, b)
+			break
+		}
+		list = list[len(list)/4+1:]
+	}
+	if len(list) == 0 {
+		_ = c.send(fOut, s.id, []byte("[]"))
+	}
+	_ = c.send(fExit, s.id, mustJSON(exitInfo{}))
+	c.remove(s.id)
+}
+
+func (c *serverConn) killStream(s *serverStream, req openReq) {
+	j := c.lookup(req.Job)
+	if req.Job == "" || j == nil {
+		c.fail(s, "no such job: "+req.Job)
+		return
+	}
+	j.kill("killed")
+	_ = c.send(fExit, s.id, mustJSON(exitInfo{}))
+	c.remove(s.id)
+}
+
+// dialStream forwards one TCP connection from the client to a target reachable from the server.
+// Data goes both ways with flow control; the stream ends when the target closes its side.
+func (c *serverConn) dialStream(s *serverStream, req openReq) {
+	if req.Target == "" {
+		c.fail(s, "target is required")
+		return
+	}
+	conn, err := net.DialTimeout("tcp", req.Target, 10*time.Second)
+	if err != nil {
+		c.fail(s, err.Error())
+		return
+	}
+	defer conn.Close()
+	s.mu.Lock()
+	s.cancel = func() { conn.Close() }
+	s.mu.Unlock()
+	_ = c.send(fMeta, s.id, mustJSON(metaInfo{Started: true}))
+	go func() { // client -> target
+		cr := s.stdinCredit()
+		for {
+			f, err := s.stdin.pop()
+			if err != nil {
+				conn.Close()
+				return
+			}
+			if f.typ == fStdinEOF {
+				if tc, ok := conn.(*net.TCPConn); ok {
+					_ = tc.CloseWrite()
+				}
+				return
+			}
+			_, werr := conn.Write(f.payload)
+			s.pend.Add(-int64(len(f.payload)))
+			cr.consume(len(f.payload))
+			if werr != nil {
+				conn.Close()
+				return
+			}
+		}
+	}()
+	buf := make([]byte, chunkSize)
+	for { // target -> client
+		n, err := s.out.take(chunkSize)
+		if err != nil {
+			s.stdin.close(errClosed)
+			c.remove(s.id)
+			return
+		}
+		k, rerr := conn.Read(buf[:n])
+		if k < n {
+			s.out.add(int64(n - k))
+		}
+		if k > 0 {
+			if err := c.send(fOut, s.id, buf[:k]); err != nil {
+				return
+			}
+		}
+		if rerr != nil {
+			s.stdin.close(errClosed)
+			_ = c.send(fExit, s.id, mustJSON(exitInfo{}))
+			c.remove(s.id)
+			return
+		}
+	}
 }
 
 // stdinLoop copies client stdin frames into the process.
@@ -653,26 +914,38 @@ func (m *muxServer) start(j *job) {
 		cmd.Env = append(os.Environ(), req.Env...)
 	}
 	prepareCmd(cmd)
-	stdout, err := cmd.StdoutPipe()
+	// Own pipes instead of StdoutPipe: cmd.Wait must not wait for the pipes to close (see run).
+	outR, outW, err := os.Pipe()
 	if err != nil {
 		j.startEr = err
 		return
 	}
-	stderr, err := cmd.StderrPipe()
+	errR, errW, err := os.Pipe()
 	if err != nil {
+		outR.Close()
+		outW.Close()
 		j.startEr = err
 		return
+	}
+	cmd.Stdout, cmd.Stderr = outW, errW
+	fail := func(err error) {
+		for _, f := range []*os.File{outR, outW, errR, errW} {
+			f.Close()
+		}
+		j.startEr = err
 	}
 	if req.Stdin {
 		if j.stdinW, err = cmd.StdinPipe(); err != nil {
-			j.startEr = err
+			fail(err)
 			return
 		}
 	}
 	if err := cmd.Start(); err != nil {
-		j.startEr = err
+		fail(err)
 		return
 	}
+	outW.Close() // the child has its own copies
+	errW.Close()
 	j.mu.Lock()
 	j.cmd, j.started = cmd, true
 	pending := j.killed
@@ -680,7 +953,7 @@ func (m *muxServer) start(j *job) {
 		j.timeout = time.AfterFunc(time.Duration(req.TimeoutMS)*time.Millisecond, func() { j.kill("timeout") })
 	}
 	j.mu.Unlock()
-	go j.run(stdout, stderr)
+	go j.run(outR, errR)
 	if pending != "" {
 		killTree(cmd)
 	}
