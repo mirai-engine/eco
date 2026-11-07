@@ -1,0 +1,7 @@
+/eco
+/eco.exe
+*.pem
+*.key
+
+/bin/
+/eco-credentials/
