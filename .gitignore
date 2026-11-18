@@ -5,3 +5,6 @@
 
 /bin/
 /eco-credentials/
+
+/.eco-deps/
+/odin/__pycache__/
