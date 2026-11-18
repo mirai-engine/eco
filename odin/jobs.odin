@@ -6,13 +6,15 @@ import "core:encoding/hex"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:strconv"
 import "core:time"
+import "deps:blake3"
 
 foreign import platform "../.eco-deps/libeco_platform.a"
 
 @(default_calling_convention="c")
 foreign platform {
-    eco_start_worker :: proc(args: [^]cstring) -> c.int ---
+    eco_start_worker :: proc(args: [^]cstring, scope: c.int) -> c.int ---
     eco_install_file :: proc(part, final: cstring) -> c.int ---
     eco_sync_dir :: proc(path: cstring) -> c.int ---
 }
@@ -21,12 +23,23 @@ JOB_ID :: 16
 JOB_HEADER :: JOB_ID
 JOB_OUTPUT_MAX :: 64*1024*1024
 
-ensure_job_namespace :: proc(server: ^Server) -> string {
+scope_key :: proc(path: string) -> [32]byte {
+    return blake3.hash(transmute([]byte)path)
+}
+
+ensure_job_namespace :: proc(server: ^Server, link: ^Link) -> string {
     peer: [32]byte
     ecdh.public_key_bytes(&server.peer, peer[:])
     name := hex.encode(peer[:])
     defer delete(name)
-    directory := fmt.aprintf("%s/%s", server.jobs, string(name))
+    directory: string
+    if link.confined {
+        scope := hex.encode(link.scope_key[:])
+        directory = fmt.aprintf("%s/%s-%s", server.jobs, string(name), string(scope))
+        delete(scope)
+    } else {
+        directory = fmt.aprintf("%s/%s", server.jobs, string(name))
+    }
     _ = os.mkdir(directory, {.Read_User, .Write_User, .Execute_User})
     cdir := strings.clone_to_cstring(directory)
     defer delete(cdir)
@@ -41,15 +54,18 @@ job_file :: proc(path, part: string) -> string {
     return fmt.aprintf("%s/%s", path, part)
 }
 
-launch_worker :: proc(path, root: string) -> bool {
+launch_worker :: proc(path, root: string, link: ^Link) -> bool {
     executable, err := os.get_executable_path(context.allocator)
     if err != nil { return false }
     defer delete(executable)
-    arguments := []string{executable, "job-worker", path, root}
-    args: [5]cstring
+    expiry := fmt.aprintf("%d", link.grant_expiry)
+    defer delete(expiry)
+    mode := "scope" if link.confined else "path"
+    arguments := []string{executable, "job-worker", path, mode, root, expiry}
+    args: [7]cstring
     defer for arg in args { if arg != nil { delete(arg) } }
     for arg, i in arguments { args[i] = strings.clone_to_cstring(arg) }
-    return eco_start_worker(raw_data(args[:])) == 0
+    return eco_start_worker(raw_data(args[:]), link.scope if link.confined else -1) == 0
 }
 
 job_spec :: proc(path: string, spec: []byte) -> bool {
@@ -95,7 +111,7 @@ job_exists :: proc(path, part: string) -> bool {
 }
 
 open_job :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, body: []byte) {
-    namespace := ensure_job_namespace(server)
+    namespace := ensure_job_namespace(server, stream.link)
     if namespace == "" { fail_call(stream, call, "job store unavailable"); return }
     defer delete(namespace)
 
@@ -131,7 +147,7 @@ open_job :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, body: []b
             fail_call(stream, call, "cannot save job or id already has different arguments")
             return
         }
-        if !job_exists(call.job_path, "claimed") && !launch_worker(call.job_path, server.root_path) {
+        if !job_exists(call.job_path, "claimed") && !launch_worker(call.job_path, server.root_path, stream.link) {
             fail_call(stream, call, "cannot start job worker; retry with the same id")
             return
         }
@@ -249,7 +265,9 @@ worker_lock :: proc(path: string) -> c.int {
     return eco_lock_local(name)
 }
 
-job_worker :: proc(path, root: string) -> int {
+job_worker :: proc(path, root, expiry_text: string, confined: bool) -> int {
+    expiry, valid := strconv.parse_u64(expiry_text, 10)
+    if !valid { return 125 }
     lock := worker_lock(path)
     if lock < 0 { return 125 }
     defer _ = eco_close(lock)
@@ -266,8 +284,8 @@ job_worker :: proc(path, root: string) -> int {
 
     root_name := strings.clone_to_cstring(root)
     defer delete(root_name)
-    fd := eco_root(root_name)
-    if fd < 0 { return 125 }
+    fd := c.int(3) if confined else eco_root(root_name)
+    if fd < 0 || (confined && (eco_scope_supported() != 1 || eco_fd_setup(fd, 0) < 0)) { return 125 }
     defer _ = eco_close(fd)
     request := job_file(path, "request")
     defer delete(request)
@@ -295,7 +313,8 @@ job_worker :: proc(path, root: string) -> int {
         outputs[i] = output
     }
     if job_exists(path, "cancel") { code = 130; return int(code) }
-    if explanation := start_process(fd, &call, spec[:n]); explanation != "" {
+    if expiry != 0 && u64(time.to_unix_seconds(time.now())) >= expiry { code = 124; return int(code) }
+    if explanation := start_process(fd, &call, spec[:n], confined); explanation != "" {
         _, _ = os.write_strings(outputs[1], explanation, "\n")
         return 125
     }
@@ -304,7 +323,11 @@ job_worker :: proc(path, root: string) -> int {
     counts: [2]int
     for {
         if eco_stopping() != 0 || job_exists(path, "cancel") { code = 130; return int(code) }
-        if time.tick_since(call.deadline) >= 0 { code = 124; return int(code) }
+        if time.tick_since(call.deadline) >= 0 ||
+           (expiry != 0 && u64(time.to_unix_seconds(time.now())) >= expiry) {
+            code = 124
+            return int(code)
+        }
         fds := [3]c.int{call.output[0], call.output[1], children}
         events := [3]c.int{POLL_READ, POLL_READ, POLL_READ}
         _ = eco_poll(raw_data(fds[:]), raw_data(events[:]), 3, 100)

@@ -45,7 +45,7 @@ def read_message(socket_):
 @contextmanager
 def background(*args, env=None):
     process = subprocess.Popen(
-        [BINARY, *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        [BINARY, *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
     )
     try:
         yield process
@@ -79,6 +79,9 @@ def main():
         with background("serve", address, server_secret, client_key, root, "run") as server:
             assert server.stderr.readline().startswith(b"eco-odin listening")
             assert cli("ping-early", address, client_secret, server_key).stdout.startswith(b"pong")
+            stranger = keys / "stranger"
+            cli("keygen", stranger)
+            assert cli("ping-early", address, stranger, server_key, check=False).returncode
             with background("client", local_socket, address, client_secret, server_key) as client:
                 deadline = time.monotonic() + 4
                 while not local_socket.exists() and time.monotonic() < deadline and client.poll() is None:
@@ -102,6 +105,22 @@ def main():
                 (root / "outside").symlink_to(keys)
                 for path in ["../keys/server", "outside/server", "/etc/passwd"]:
                     assert cli("read", path, env=env, check=False).returncode != 0
+
+                with socket.socket(socket.AF_UNIX) as local:
+                    local.settimeout(4)
+                    local.connect(str(local_socket))
+                    send_message(local, 23)  # Session
+                    assert read_message(local) == bytes([39])
+                    for _ in range(25):
+                        send_message(local, 1)
+                        assert read_message(local) == b"\x25\0\0\0\0"
+                        send_message(local, 2, b"fixture")
+                        assert read_message(local)[0] == 35
+                        assert read_message(local) == b"\x25\0\0\0\0"
+                    send_message(local, 8)
+                    assert read_message(local)[0] == 38
+                    send_message(local, 1)
+                    assert read_message(local) == b"\x25\0\0\0\0"
 
                 # The daemon should service a second stream while a process is still running.
                 with ThreadPoolExecutor() as pool:

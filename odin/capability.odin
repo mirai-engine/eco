@@ -109,8 +109,8 @@ issue_capability :: proc(args: []string) -> int {
         case: return error_exit("rights must use r, w, x, or t")
         }
     }
-    if mask == 0 || (mask & (CAP_RUN | CAP_TUNNEL) != 0 && args[5] != ".") {
-        return error_exit("execution and tunnel grants require full root scope")
+    if mask == 0 || (mask & CAP_TUNNEL != 0 && args[5] != ".") {
+        return error_exit("tunnel grants require full root scope")
     }
 
     buffer: [len(CAP_DOMAIN)+CAP_MAX]byte
@@ -156,7 +156,7 @@ verify_capability :: proc(policy: ^Policy, peer: ^ecdh.Public_Key, token: []byte
         return {}, false
     }
     scope := string(token[CAP_PREFIX:end])
-    if token[1] & (CAP_RUN | CAP_TUNNEL) != 0 && scope != "." { return {}, false }
+    if token[1] & CAP_TUNNEL != 0 && scope != "." { return {}, false }
     return Grant{scope, expiry, token[1]}, true
 }
 

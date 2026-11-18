@@ -27,6 +27,10 @@
 #include <unistd.h>
 
 extern char **environ;
+int eco_ring_setup(void);
+void eco_ring_forget(int fd);
+int eco_ring_poll(int *fds, int *events, int count, int timeout);
+int eco_restrict_scope(int scope);
 
 static volatile sig_atomic_t stopping;
 static void handle_signal(int sig) { (void)sig; stopping = 1; }
@@ -42,6 +46,14 @@ void eco_install_signals(void) {
 }
 
 int eco_stopping(void) { return stopping; }
+
+void eco_listening(int port) {
+    fprintf(stderr, "eco-odin listening on UDP %d\n", port);
+}
+
+void eco_ring_ready(void) {
+    fputs("eco-odin io_uring ready\n", stderr);
+}
 
 int eco_wait(int fd, int timeout) {
     struct pollfd p = { .fd = fd, .events = POLLIN };
@@ -158,7 +170,8 @@ int eco_poll(int *fds, int *events, int count, int timeout) {
         if (result != -2) return result;
     }
 #endif
-    return poll_portable(fds, events, count, timeout);
+    int ring_result = eco_ring_poll(fds, events, count, timeout);
+    return ring_result == -2 ? poll_portable(fds, events, count, timeout) : ring_result;
 }
 
 static int unix_address(struct sockaddr_un *address, const char *name) {
@@ -225,6 +238,7 @@ int eco_close(int fd) {
 #if defined(__APPLE__)
     forget_fd(fd);
 #endif
+    eco_ring_forget(fd);
     return close(fd);
 }
 int eco_unlink(const char *name) { return unlink(name); }
@@ -313,7 +327,14 @@ static int open_pipe(int fds[2]) {
     return 0;
 }
 
-int eco_spawn(char *const args[], int fds[2], int workdir, int *to_child) {
+static void scope_failed(void) {
+    static const char message[] = "eco-odin: cannot start sandboxed command\n";
+    ssize_t ignored = write(STDERR_FILENO, message, sizeof(message) - 1);
+    (void)ignored;
+    _exit(126);
+}
+
+int eco_spawn(char *const args[], int fds[2], int workdir, int *to_child, int scope) {
     int out[2], err[2], input[2] = {-1, -1};
     if (to_child != NULL) {
         if (pipe(input) < 0) return -1;
@@ -332,6 +353,32 @@ int eco_spawn(char *const args[], int fds[2], int workdir, int *to_child) {
         close(out[0]); close(out[1]);
         return -1;
     }
+    if (scope >= 0) {
+        pid_t child = fork();
+        if (child == 0) {
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTERM, SIG_DFL);
+            signal(SIGPIPE, SIG_DFL);
+            int in = to_child ? input[0] : open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (dup2(out[1], STDOUT_FILENO) < 0 || dup2(err[1], STDERR_FILENO) < 0 ||
+                in < 0 || dup2(in, STDIN_FILENO) < 0 || setpgid(0, 0) < 0 ||
+                fchdir(workdir) < 0 || eco_restrict_scope(scope) < 0) scope_failed();
+            execvp(args[0], args);
+            scope_failed();
+        }
+        if (child > 0) (void)setpgid(child, child);
+        close(out[1]);
+        close(err[1]);
+        if (to_child) {
+            close(input[0]);
+            if (child < 0) close(input[1]);
+            else *to_child = input[1];
+        }
+        if (child < 0) { close(out[0]); close(err[0]); }
+        else { fds[0] = out[0]; fds[1] = err[0]; }
+        return (int)child;
+    }
+
     posix_spawn_file_actions_t files;
     posix_spawnattr_t attr;
     int files_init = posix_spawn_file_actions_init(&files) == 0;
@@ -435,7 +482,7 @@ int eco_start_daemon(char *const args[]) {
     _exit(125);
 }
 
-int eco_spawn_pty(char *const args[], int *master, int workdir, unsigned short rows, unsigned short cols) {
+int eco_spawn_pty(char *const args[], int *master, int workdir, unsigned short rows, unsigned short cols, int scope) {
     struct winsize size = { .ws_row = rows, .ws_col = cols };
     int fd;
     pid_t pid = forkpty(&fd, NULL, NULL, &size);
@@ -444,7 +491,7 @@ int eco_spawn_pty(char *const args[], int *master, int workdir, unsigned short r
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
         signal(SIGPIPE, SIG_DFL);
-        if (fchdir(workdir) < 0) _exit(126);
+        if (fchdir(workdir) < 0 || (scope >= 0 && eco_restrict_scope(scope) < 0)) scope_failed();
         execvp(args[0], args);
         _exit(errno == ENOENT ? 127 : 126);
     }
@@ -489,6 +536,7 @@ int eco_terminal_raw(int fd) {
 }
 
 #include <netdb.h>
+#include <netinet/tcp.h>
 int eco_net_open(const char *address, int datagram, int *connecting) {
     char host[64];
     const char *port = strrchr(address, ':');
@@ -539,10 +587,11 @@ int eco_net_recv_datagram(int fd, void *buf, int count) {
     return (int)n;
 }
 
-int eco_start_worker(char *const args[]) {
+int eco_start_worker(char *const args[], int scope) {
     pid_t first = fork();
     if (first < 0) return -1;
     if (first == 0) {
+        if (scope >= 0 && (dup2(scope, 3) < 0 || fcntl(3, F_SETFD, 0) < 0)) _exit(1);
         pid_t worker = eco_start_daemon(args);
         _exit(worker < 0 ? 1 : 0);
     }
@@ -557,7 +606,10 @@ static void notify_child(int sig) {
     (void)sig;
     int saved = errno;
     const unsigned char event = 1;
-    if (child_events_write >= 0) (void)write(child_events_write, &event, 1);
+    if (child_events_write >= 0) {
+        ssize_t ignored = write(child_events_write, &event, 1);
+        (void)ignored;
+    }
     errno = saved;
 }
 
@@ -595,4 +647,46 @@ int eco_sync_dir(const char *path) {
     int result = fsync(dir);
     close(dir);
     return result;
+}
+
+#include <sys/time.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
+
+int eco_bulk_socket(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) return -1;
+    struct timeval timeout = {.tv_sec = 15};
+    int no_delay = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay)) < 0 ||
+           setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+           setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ? -1 : 0;
+}
+
+// Return 0 in a worker with exactly socket 3 and its permitted directory 4.
+int eco_bulk_worker(int socket, int scope) {
+    pid_t worker = fork();
+    if (worker != 0) {
+        if (worker > 0) (void)setpgid(worker, worker);
+        return (int)worker;
+    }
+    if (setpgid(0, 0) < 0) _exit(125);
+    int data = fcntl(socket, F_DUPFD_CLOEXEC, 5);
+    int root = fcntl(scope, F_DUPFD_CLOEXEC, 5);
+    if (data < 0 || root < 0 || dup2(data, 3) < 0 || dup2(root, 4) < 0) _exit(125);
+#if defined(__linux__)
+    if (syscall(SYS_close_range, 5u, ~0u, 0u) == 0) return 0;
+#endif
+    DIR *open_fds = opendir("/dev/fd");
+    if (!open_fds) _exit(125);
+    int directory = dirfd(open_fds);
+    struct dirent *item;
+    while ((item = readdir(open_fds)) != NULL) {
+        char *end;
+        long fd = strtol(item->d_name, &end, 10);
+        if (!*end && fd >= 5 && fd != directory) close((int)fd);
+    }
+    closedir(open_fds);
+    return 0;
 }

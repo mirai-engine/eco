@@ -2,7 +2,7 @@
 
 The [Odin Noise/UDP implementation](odin/README.md) provides a binary protocol, native file
 operations, a persistent local client, POSIX terminals, tunnels and durable jobs. Its verified
-build target is macOS arm64. The rest of this README describes the Go TLS implementation.
+builds are macOS arm64 and Ubuntu Linux arm64. The rest of this README describes the Go TLS implementation.
 
 Experimental remote command transport for agents. One TLS 1.3 connection carries many concurrent
 commands, file transfers and pings as multiplexed binary streams, and survives network drops without

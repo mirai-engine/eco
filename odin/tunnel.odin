@@ -191,6 +191,8 @@ forward :: proc(bind: net.Endpoint, target_text: string, datagram: bool) -> int 
     }
     defer _ = eco_close(service)
     if eco_fd_setup(service, 1) < 0 { return error_exit("cannot configure local forward") }
+    _ = eco_ring_setup()
+    defer eco_ring_close()
     fmt.eprintfln("eco-odin forwarding port %d -> %s", bind.port, target_text)
     relays: [STREAM_MAX]^Relay
     defer for &relay in relays { if relay != nil { close_relay(&relay) } }

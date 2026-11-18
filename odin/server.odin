@@ -3,7 +3,6 @@ package eco
 import "core:c"
 import "core:crypto/ecdh"
 import "core:encoding/hex"
-import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strings"
@@ -12,7 +11,7 @@ import "deps:blake3"
 
 Op :: enum u8 {
     Ping = 1, Stat, List, Read, Write, Hash, Watch, Run, Tty, Tcp, Udp, Start, Attach, Jobs, Kill,
-    Upload = 16, Commit, Cancel, Touch, Input, Input_End, Resize,
+    Upload = 16, Commit, Cancel, Touch, Input, Input_End, Resize, Session,
     Stdout = 32, Stderr, Entry, Info, Digest, Done, Failure, Ready, Output_End,
 }
 
@@ -139,7 +138,7 @@ stat_call :: proc(stream: ^Stream, call: ^Server_Call, first: bool) -> bool {
     return true
 }
 
-start_process :: proc(root: c.int, call: ^Server_Call, data: []byte) -> string {
+start_process :: proc(root: c.int, call: ^Server_Call, data: []byte, confined := false) -> string {
     if len(data) < 13 || data[len(data)-1] != 0 {
         return "invalid run arguments"
     }
@@ -180,11 +179,13 @@ start_process :: proc(root: c.int, call: ^Server_Call, data: []byte) -> string {
         count += 1
         offset += strings.index_byte(string(body[offset:]), 0)+1
     }
+    scope := root if confined else -1
+    if confined && eco_scope_supported() != 1 { return "OS cannot enforce the execution scope" }
     if tty {
-        call.pid = eco_spawn_pty(raw_data(args[:]), &call.output[0], dir, rows, cols)
+        call.pid = eco_spawn_pty(raw_data(args[:]), &call.output[0], dir, rows, cols, scope)
     } else {
         input := &call.input if flags == 1 else nil
-        call.pid = eco_spawn(raw_data(args[:]), raw_data(call.output[:]), dir, input)
+        call.pid = eco_spawn(raw_data(args[:]), raw_data(call.output[:]), dir, input, scope)
     }
     if call.pid < 0 {
         return "cannot start executable"
@@ -194,13 +195,14 @@ start_process :: proc(root: c.int, call: ^Server_Call, data: []byte) -> string {
 }
 
 open_run :: proc(stream: ^Stream, call: ^Server_Call, body: []byte) {
-    if error := start_process(stream.link.scope, call, body); error != "" {
+    if error := start_process(stream.link.scope, call, body, stream.link.confined); error != "" {
         fail_call(stream, call, error)
     }
 }
 
 open_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message: []byte) {
     call.op = Op(message[0])
+    stream.bulk = call.op == .Read || call.op == .Write
     body := message[1:]
     if call.op == .Ping {
         if len(body) != 0 { fail_call(stream, call, "invalid ping"); return }
@@ -208,7 +210,8 @@ open_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message:
         return
     }
     if call.op >= .Start && call.op <= .Kill {
-        if server.access != .Run || stream.link.rights & CAP_RUN == 0 || server.jobs == "" {
+        if server.access != .Run || stream.link.rights & CAP_RUN == 0 ||
+           (stream.link.confined && eco_scope_supported() != 1) || server.jobs == "" {
             fail_call(stream, call, "persistent jobs are disabled")
             return
         }
@@ -459,7 +462,7 @@ process_stream :: proc(server: ^Server, slot: ^^Stream) -> bool {
             call.pid = -1
             fail_call(stream, call, "execution timed out")
         }
-        for i in 0..<CALL_QUEUE {
+        for i in 0..<window_for(stream) {
             if call.done { break }
             if call.input_offset < call.input_used {
                 if !pump_input(call) { break }
@@ -468,8 +471,8 @@ process_stream :: proc(server: ^Server, slot: ^^Stream) -> bool {
             if message == nil { break }
             receive_call(stream, call, message)
         }
-        for i in 0..<CALL_QUEUE {
-            if call.done || ikcp_waitsnd(stream.kcp) >= CALL_QUEUE { break }
+        for i in 0..<window_for(stream) {
+            if call.done || ikcp_waitsnd(stream.kcp) >= c.int(window_for(stream)) { break }
             if !pump_call(stream, call, buffer[:MESSAGE_MAX-1]) { break }
             progressed = true
         }
@@ -485,7 +488,7 @@ process_stream :: proc(server: ^Server, slot: ^^Stream) -> bool {
     return progressed
 }
 
-receive_server :: proc(server: ^Server, packet: []byte, from: net.Endpoint) {
+receive_server :: proc(server: ^Server, packet, scratch: []byte, from: net.Endpoint) {
     header, ok := parse_header(packet)
     if !ok { return }
     for link in server.links {
@@ -496,7 +499,13 @@ receive_server :: proc(server: ^Server, packet: []byte, from: net.Endpoint) {
                 _, _ = net.send_udp(server.udp, link.server_hello[:link.welcome_len], from)
             }
         } else {
-            receive_record(link, header, from, packet, true)
+            if link.closing || time.tick_since(link.born) >= SESSION_LIFETIME ||
+               (link.grant_expiry != 0 && u64(time.to_unix_seconds(time.now())) >= link.grant_expiry) {
+                return
+            }
+            if query := receive_record(link, header, from, packet, scratch, true); query != nil {
+                answer_query(link, query)
+            }
         }
         return
     }
@@ -526,26 +535,33 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public
     defer net.close(udp)
     if eco_fd_setup(c.int(udp), 1) < 0 { return error_exit("cannot configure UDP socket") }
     server := Server{udp = udp, own = own^, peer = peer^, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
+    bulk: Bulk_Server
+    if bulk_enabled() && !enable_bulk(endpoint, &bulk) { return error_exit("cannot listen for bulk TCP") }
+    defer clear_bulk(&bulk)
     defer ecdh.private_key_clear(&server.own)
     defer for &link in server.links { if link != nil { close_link(&link) } }
 
     children := eco_child_events()
     if children < 0 { return error_exit("cannot subscribe to child exit") }
     defer _ = eco_close(children)
-    fmt.eprintln("eco-odin listening on UDP", endpoint.port)
+    eco_listening(c.int(endpoint.port))
+    if ODIN_OS == .Linux && eco_ring_setup() == 1 { eco_ring_ready() }
+    defer eco_ring_close()
     buffer: [MAX_PACKET+1]byte
+    scratch: [KCP_MTU]byte
     for eco_stopping() == 0 {
         for eco_read(children, raw_data(buffer[:]), c.int(len(buffer))) > 0 {}
         for _ in 0..<64 {
             n, from, read_err := net.recv_udp(udp, buffer[:])
             if read_err != nil { break }
-            receive_server(&server, buffer[:n], from)
+            receive_server(&server, buffer[:n], scratch[:], from)
         }
         timeout: c.int = 1000
         fds, events: [66]c.int
         fds[0], events[0] = c.int(udp), POLL_READ
         fds[1], events[1] = children, POLL_READ
         count := 2
+        poll_bulk(&bulk, &server, fds[:], events[:], &count, &timeout)
         for &link in server.links {
             if link == nil { continue }
             if link.closing || (link.grant_expiry != 0 && u64(time.to_unix_seconds(time.now())) >= link.grant_expiry) ||
@@ -554,21 +570,22 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public
                 close_link(&link)
                 continue
             }
+            if drain_pacer(link) { timeout = min(timeout, 1) }
             for &stream in link.streams {
                 if stream == nil { continue }
                 progressed := process_stream(&server, &stream)
                 timeout = min(timeout, 10)
-                if progressed && stream != nil && ikcp_waitsnd(stream.kcp) < CALL_QUEUE { timeout = 0 }
+                if progressed && stream != nil && ikcp_waitsnd(stream.kcp) < c.int(window_for(stream)) { timeout = 0 }
                 if stream == nil || stream.application == nil || count+2 > len(fds) { continue }
                 call := cast(^Server_Call)stream.application
                 if call.op == .Tcp || call.op == .Udp {
                     mask: c.int
-                    if !call.output_end && ikcp_waitsnd(stream.kcp) < CALL_QUEUE { mask |= POLL_READ }
+                    if !call.output_end && ikcp_waitsnd(stream.kcp) < c.int(window_for(stream)) { mask |= POLL_READ }
                     if call.connecting || call.input_offset < call.input_used { mask |= POLL_WRITE }
                     fds[count], events[count] = call.file, mask
                     count += 1
                 }
-                if (call.op == .Run || call.op == .Tty) && ikcp_waitsnd(stream.kcp) < CALL_QUEUE {
+                if (call.op == .Run || call.op == .Tty) && ikcp_waitsnd(stream.kcp) < c.int(window_for(stream)) {
                     for file in call.output {
                         if file >= 0 {
                             fds[count], events[count] = file, POLL_READ

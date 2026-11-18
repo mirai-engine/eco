@@ -7,10 +7,18 @@ The wire protocol uses binary records, and file transfers use BLAKE3.
 
 ## Build and pair
 
-The verified build targets macOS arm64. It uses Odin with `core:crypto/noise` (tested with
-`dev-2026-10` at `05d3fbf34`), a C toolchain and Git. The script fetches the pinned KCP and
-odin-blake3 sources on the first build. The POSIX layer uses poll for small descriptor sets and switches to kqueue on macOS as they grow.
-The Odin runtime path has no dependency on Go, SSH, TLS or a certificate authority.
+The verified builds are macOS arm64 and Ubuntu 24.04 Linux arm64. Build with Odin containing
+`core:crypto/noise` (tested with `dev-2026-10`), a C toolchain and Git. The script fetches pinned KCP
+and odin-blake3 sources. On Linux, `pkg-config` and liburing development headers enable the optional
+io_uring backend. On both platforms, `pkg-config` and libcrypto development headers enable bulk
+AES-GCM acceleration.
+
+macOS uses poll for small descriptor sets and kqueue as they grow. Linux uses the same small-set
+poll path and can use io_uring for larger sets when the kernel permits it. Set
+`ECO_ODIN_IO_URING=1` to exercise the ring even for small sets. With that override the server logs
+`eco-odin io_uring ready` after initializing the ring. Set `ECO_ODIN_IO_URING=0` to use poll only.
+
+The Odin daemon uses Noise, binary framing and pinned keys.
 
 ```sh
 ./odin/build.sh
@@ -39,6 +47,14 @@ Alternatively, run `eco-odin client SOCKET UDP KEY PEER` in the foreground. Use 
 `ECO_ODIN_SOCKET` in an owner-only directory for each distinct server, identity or capability.
 An existing daemon keeps its original settings until it exits.
 
+For reusable local queries, connect directly to that Unix socket. Each frame starts with a
+two-byte little-endian length followed by an opcode byte and its body. Send opcode 23 with
+an empty body to start a reusable session and wait for opcode 39. Send ping (1, empty body)
+or stat (2, relative path bytes) serially. A stat response carries metadata (35, type byte
+and two little-endian uint64 values for size and mtime in nanoseconds). Both operations end
+with 37 and a zero 32-bit status, or 38 and an error message. The client and server use an
+authenticated request/reply record, with retries for loss, for these read-only operations.
+
 ## Operations
 
 ```sh
@@ -65,7 +81,16 @@ eco-odin kill "$job"
 File paths are relative to the server root or the granted subdirectory. Native operations walk
 directory descriptors and reject symlink traversal. Uploads are verified before atomic replacement.
 Downloads verify their whole BLAKE3 digest before replacing the local destination. `watch` samples
-metadata every 250 ms. It can miss changes between samples.
+metadata every 250 ms and detects changes visible at the sampling boundary.
+
+Set `ECO_ODIN_BULK_TCP=1` on both machines to send `put` and `get` over a separate TCP listener
+on the same numeric port. The bulk client uses `ECO_ODIN_ADDR`, `ECO_ODIN_KEY`, `ECO_ODIN_PEER`
+and, when required, `ECO_ODIN_CAPABILITY`. The Noise IK handshake uses a distinct prologue, and
+a transport-encrypted confirmation carries fresh keying material. HKDF-SHA256 binds it to the
+Noise transcript, and separate AES-256-GCM keys authenticate the two record directions. The
+server starts a transfer worker only after it verifies that confirmation. Libcrypto loads on
+demand when available. `ECO_ODIN_BULK_CRYPTO=portable` selects the wire-compatible Odin AES
+implementation. Each bulk connection is bounded to 2²² records per direction.
 
 The remote target of a forward is a numeric IP and port as seen by the server. TCP forwards preserve
 half-close. UDP forwards have a 1,135-byte application datagram limit and a bounded queue per sender.
@@ -93,9 +118,17 @@ export ECO_ODIN_CAPABILITY=SIGNED_GRANT_FROM_PREVIOUS_COMMAND
 
 A grant binds the server and client identities, expiry, operations and directory. The letters are
 `r` for file reads and metadata, `w` for writes, `x` for processes and jobs, and `t` for forwarding.
-The server mode and grant both apply. Process and forwarding grants require the full-root scope
-`.`. A process runs with the daemon account's privileges and is not confined by the file path grant.
-Forwarding targets are reachable wherever the daemon account can connect.
+The server mode and grant both apply. Forwarding grants use the full-root scope `.`, and targets
+are reachable wherever the daemon account can connect.
+
+On Linux with Landlock ABI 3 or newer, an `x` grant can target a subdirectory. Run, PTY and
+detached jobs inherit that directory boundary. They can read system tool directories, write
+inside the granted project, and receive a minimal environment. A seccomp filter denies creation
+of network sockets and access to selected host-wide interfaces. This is filesystem and process
+confinement for builds with local dependencies. It does not impose CPU or disk quotas.
+Systems that cannot enforce the scope reject a scoped execution request. An explicit `x` grant
+for the full root `.` uses the daemon account's ordinary privileges. Signed job lifetimes also
+respect the grant expiry. The job namespace binds to the client identity and granted directory.
 
 ## Transport behavior
 
@@ -106,15 +139,15 @@ Forwarding targets are reachable wherever the daemon account can connect.
 - Transport records have a 512-packet replay window and fit within a 1,200-byte UDP payload. A
   challenge-response verifies a new return path before changing the session endpoint.
 - Each active stream uses KCP for selective retransmission and flow control. Congestion windows
-  are per stream. There is no connection-wide pacing or separate bulk path. A transfer or command
-  can keep streaming while another stream recovers from packet loss.
+  are per stream. A shared byte budget paces large UDP file records across streams. Set
+  `ECO_ODIN_BULK_MBPS` on each sending daemon to match the available rate in megabits per second.
+  The default budget is 10,000 Mbps. Control and acknowledgment records can pass queued file data.
 - The server expires idle sessions and rotates them within 15 minutes. Clients keep an idle session
   warm while the local daemon runs. On a lost session, an in-flight call can have an unknown result.
   Use detached jobs and their explicit IDs when restart recovery matters.
 
-The current implementation uses bounded copies in the framing and retransmission paths. The Odin
-port has no Windows backend yet. ConPTY, IOCP, Windows Named Pipes and a Linux io_uring backend
-remain outside this build. The macOS tests do not validate the POSIX fallback on Linux.
+The current implementation uses bounded copies in the framing and retransmission paths.
+Windows needs a separate backend for ConPTY, IOCP and Named Pipes.
 
 ## Verify and measure
 
@@ -124,9 +157,12 @@ remain outside this build. The macOS tests do not validate the POSIX fallback on
 python3 -B odin/smoke.py
 python3 -B odin/extended_test.py
 python3 -B odin/bench.py --bulk-mib 8
+python3 -B odin/compare.py --previous /path/to/old/eco
 ```
 
 The loopback tests cover binary files, verified atomic replacement, concurrent streams, terminal
 resize, stdin, both types of forwarding, signed scopes, replay and corruption handling, source-port
-migration, and job recovery after restarting both daemons. The benchmark reports CLI launch
-separately from warm requests made directly over the daemon's Unix socket.
+migration, scoped builds on Linux, encrypted bulk transfers and job recovery after restarting
+both daemons. The comparison interleaves the old ECO and a local OpenSSH instance with
+temporary credentials. It reports CLI launch separately from warm requests and validates each
+download independently.

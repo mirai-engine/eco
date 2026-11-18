@@ -14,6 +14,8 @@ foreign import platform "../.eco-deps/libeco_platform.a"
 foreign platform {
     eco_install_signals :: proc() ---
     eco_stopping :: proc() -> c.int ---
+    eco_listening :: proc(port: c.int) ---
+    eco_ring_ready :: proc() ---
     eco_wait :: proc(fd, timeout: c.int) -> c.int ---
     eco_fd_setup :: proc(fd, nonblock: c.int) -> c.int ---
     eco_poll :: proc(fds, events: [^]c.int, count, timeout: c.int) -> c.int ---
@@ -35,8 +37,8 @@ foreign platform {
     eco_rename :: proc(dir: c.int, from, to: cstring) -> c.int ---
     eco_remove :: proc(dir: c.int, name: cstring) -> c.int ---
     eco_sync :: proc(fd: c.int) -> c.int ---
-    eco_spawn :: proc(args: [^]cstring, fds: [^]c.int, workdir: c.int, input: ^c.int) -> c.int ---
-    eco_spawn_pty :: proc(args: [^]cstring, fd: ^c.int, workdir: c.int, rows, cols: u16) -> c.int ---
+    eco_spawn :: proc(args: [^]cstring, fds: [^]c.int, workdir: c.int, input: ^c.int, scope: c.int) -> c.int ---
+    eco_spawn_pty :: proc(args: [^]cstring, fd: ^c.int, workdir: c.int, rows, cols: u16, scope: c.int) -> c.int ---
     eco_terminal_resize :: proc(fd: c.int, rows, cols: u16) -> c.int ---
     eco_terminal_size :: proc(fd: c.int, rows, cols: ^u16) -> c.int ---
     eco_terminal_restore :: proc() ---
@@ -44,6 +46,9 @@ foreign platform {
     eco_child_poll :: proc(pid: c.int, status: ^c.int) -> c.int ---
     eco_child_kill :: proc(pid: c.int) ---
     eco_child_events :: proc() -> c.int ---
+    eco_scope_supported :: proc() -> c.int ---
+    eco_ring_setup :: proc() -> c.int ---
+    eco_ring_close :: proc() ---
 
     ikcp_create :: proc(conv: u32, user: rawptr) -> rawptr ---
     ikcp_release :: proc(kcp: rawptr) ---
@@ -80,7 +85,7 @@ POLL_WRITE :: 4
 POLL_CLOSED :: 8 | 16 | 32
 
 Packet_Kind :: enum u8 {
-    Hello = 1, Welcome, Data, Path_Challenge, Path_Response, Confirm, Keepalive, Close,
+    Hello = 1, Welcome, Data, Path_Challenge, Path_Response, Confirm, Keepalive, Close, Query, Query_Result,
 }
 
 Record :: struct {
@@ -105,6 +110,8 @@ Link :: struct {
     scope: c.int,
     grant_expiry: u64,
     rights: u8,
+    confined: bool,
+    scope_key: [32]byte,
     path: net.Endpoint,
     challenge: [16]byte,
     challenge_at: time.Tick,
@@ -114,6 +121,7 @@ Link :: struct {
     high_stream: u32,
     history: [STREAM_HISTORY]u32,
     streams: [STREAM_MAX]^Stream,
+    pacer: ^Pacer,
 }
 
 Stream :: struct {
@@ -122,7 +130,7 @@ Stream :: struct {
     kcp: rawptr,
     last_seen, began: time.Tick,
     application: rawptr,
-    finished: bool,
+    finished, bulk: bool,
 }
 
 get_u32 :: proc(data: []byte) -> u32 {
@@ -159,7 +167,7 @@ parse_header :: proc(data: []byte) -> (Record, bool) {
     }
     kind := Packet_Kind(data[4])
     id, nonce := get_u64(data[8:]), get_u64(data[16:])
-    if kind < .Hello || kind > .Close || id == 0 {
+    if kind < .Hello || kind > .Query_Result || id == 0 {
         return {}, false
     }
     return {kind, id, nonce}, true
@@ -337,6 +345,8 @@ accept_link :: proc(udp: net.UDP_Socket, from: net.Endpoint, packet: []byte, hea
     if scope < 0 { return nil }
     link := new(Link)
     link.scope, link.rights, link.grant_expiry = scope, grant.mask, grant.expiry
+    link.confined = grant.scope != "." && grant.mask & CAP_RUN != 0
+    if link.confined { link.scope_key = scope_key(grant.scope) }
     link.id, link.udp, link.remote = header.id, udp, from
     link.hello_len = copy(link.client_hello[:], packet)
     write_header(link.server_hello[:], .Welcome, header.id, 0)
@@ -358,7 +368,12 @@ kcp_output :: proc "c" (data: rawptr, length: c.int, _: rawptr, user: rawptr) ->
     stream := cast(^Stream)user
     link := stream.link
     // KCP will retransmit when a datagram is dropped, including a local send error.
-    _ = send_record(link, .Data, (cast([^]byte)data)[:length], link.remote)
+    bytes := (cast([^]byte)data)[:length]
+    if stream.bulk && bulk_segments(bytes) {
+        paced_output(link, bytes)
+    } else {
+        _ = send_record(link, .Data, bytes, link.remote)
+    }
     return 0
 }
 
@@ -389,7 +404,7 @@ new_stream :: proc(link: ^Link, id: u32) -> ^Stream {
         }
         ikcp_setoutput(stream.kcp, kcp_output)
         _ = ikcp_nodelay(stream.kcp, 1, 10, 2, 0)
-        _ = ikcp_wndsize(stream.kcp, 32, 32)
+        _ = ikcp_wndsize(stream.kcp, 64, 128)
         ikcp_update(stream.kcp, tick_ms())
         link.high_stream = max(link.high_stream, id)
         link.history[id % STREAM_HISTORY] = id
@@ -430,28 +445,29 @@ valid_segments :: proc(data: []byte) -> bool {
     return len(data) >= KCP_OVERHEAD && len(remaining) == 0
 }
 
-receive_record :: proc(link: ^Link, header: Record, from: net.Endpoint, packet: []byte, accept_new: bool) {
-    if header.kind < .Data { return }
-    buffer: [KCP_MTU]byte
+receive_record :: proc(link: ^Link, header: Record, from: net.Endpoint, packet, buffer: []byte, accept_new: bool) -> []byte {
+    if header.kind < .Data { return nil }
     plain, ok := unseal(link, header, packet, buffer[:])
-    if !ok || !handle_path(link, header, from, plain) { return }
+    if !ok || !handle_path(link, header, from, plain) { return nil }
     link.seen = time.tick_now()
     link.verified = true
-    if header.kind == .Close { link.closing = true; return }
+    if header.kind == .Close { link.closing = true; return nil }
     if header.kind == .Keepalive {
         if accept_new { _ = send_record(link, .Keepalive, plain, link.remote) }
-        return
+        return nil
     }
-    if header.kind != .Data || !valid_segments(plain) { return }
+    if header.kind == (.Query if accept_new else .Query_Result) { return plain }
+    if header.kind != .Data || !valid_segments(plain) { return nil }
     id := get_u32(plain)
     stream := find_stream(link, id)
     if stream == nil && accept_new && plain[4] == 81 && get_u32(plain[12:]) == 0 {
         stream = new_stream(link, id)
     }
-    if stream == nil { return }
+    if stream == nil { return nil }
     if ikcp_input(stream.kcp, raw_data(plain), c.long(len(plain))) >= 0 {
         stream.last_seen = link.seen
     }
+    return nil
 }
 
 read_message :: proc(stream: ^Stream, buffer: []byte) -> []byte {
@@ -466,5 +482,6 @@ flush_stream :: proc(stream: ^Stream) {
 }
 
 reset_link :: proc(link: ^Link) {
+    release_pacer(link)
     noise.cipherstates_reset(&link.cipher)
 }

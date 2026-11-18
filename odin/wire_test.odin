@@ -72,3 +72,20 @@ record_auth_and_order_tests :: proc(t: ^testing.T) {
     _, valid = unseal(&incoming, h1, first, dst[:])
     testing.expect(t, !valid)
 }
+
+@(test)
+identity_comparison_test :: proc(t: ^testing.T) {
+    a, b: ecdh.Private_Key
+    defer ecdh.private_key_clear(&a)
+    defer ecdh.private_key_clear(&b)
+    testing.expect(t, ecdh.private_key_generate(&a, .X25519))
+    testing.expect(t, ecdh.private_key_generate(&b, .X25519))
+    p, q: ecdh.Public_Key
+    ecdh.public_key_set_priv(&p, &a)
+    ecdh.public_key_set_priv(&q, &b)
+    p_bytes, q_bytes: [32]byte
+    ecdh.public_key_bytes(&p, p_bytes[:])
+    ecdh.public_key_bytes(&q, q_bytes[:])
+    testing.expect(t, p_bytes != q_bytes)
+    testing.expect(t, !ecdh.public_key_equal(&p, &q))
+}

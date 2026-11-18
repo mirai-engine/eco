@@ -20,11 +20,30 @@ dependency kcp https://github.com/skywind3000/kcp.git b1a7a2101dcbb96017681a500d
 
 "${CC:-cc}" -O3 -c .eco-deps/kcp/ikcp.c -o .eco-deps/ikcp.o
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Wno-deprecated-declarations -O2 -c odin/platform.c -o .eco-deps/platform.o
-ar rcs .eco-deps/libeco_platform.a .eco-deps/ikcp.o .eco-deps/platform.o
+linux_flags=
+link_flags=
+if [ "$(uname -s)" = Linux ]; then
+    link_flags="-extra-linker-flags:-lutil"
+    if command -v pkg-config >/dev/null && pkg-config --exists liburing; then
+        linux_flags="-DECO_HAVE_LIBURING=1"
+        link_flags="-extra-linker-flags:-lutil -luring"
+    fi
+fi
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 $linux_flags -c odin/platform_linux.c -o .eco-deps/platform_linux.o
+if command -v pkg-config >/dev/null && pkg-config --exists libcrypto; then
+    crypto_dir=$(pkg-config --variable=libdir libcrypto)
+    crypto_name=libcrypto.so
+    if [ "$(uname -s)" = Darwin ]; then crypto_name=libcrypto.dylib; fi
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 $(pkg-config --cflags libcrypto) \
+        "-DECO_LIBCRYPTO=\"$crypto_dir/$crypto_name\"" -c odin/platform_crypto.c -o .eco-deps/platform_crypto.o
+else
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 -c odin/platform_crypto.c -o .eco-deps/platform_crypto.o
+fi
+ar rcs .eco-deps/libeco_platform.a .eco-deps/ikcp.o .eco-deps/platform.o .eco-deps/platform_linux.o .eco-deps/platform_crypto.o
 
 lock_flags="-collection:deps=$PWD/.eco-deps"
 if [ "${1:-}" = test ]; then
     shift
-    exec "${ODIN:-odin}" test odin "$lock_flags" "$@"
+    exec "${ODIN:-odin}" test odin "$lock_flags" ${link_flags:+"$link_flags"} "$@"
 fi
-exec "${ODIN:-odin}" build odin "$lock_flags" -o:speed -out:bin/eco-odin "$@"
+exec "${ODIN:-odin}" build odin "$lock_flags" ${link_flags:+"$link_flags"} -o:speed -out:bin/eco-odin "$@"

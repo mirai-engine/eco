@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import pty
 import selectors
+import select
 import socket
 import struct
+import sys
 import subprocess
 import tempfile
 import termios
@@ -241,7 +243,7 @@ def test_capabilities(base, root, server_secret, server_key, client_secret, clie
     (root / "scope" / "link").symlink_to(root / "outside")
     (root / "outside").write_bytes(b"disallowed")
     capability = cli("grant", key_path, server_key, client_key, "r", "60", "scope").stdout.decode().strip()
-    assert cli("grant", key_path, server_key, client_key, "x", "60", "scope", check=False).returncode
+    assert cli("grant", key_path, server_key, client_key, "t", "60", "scope", check=False).returncode
     with background("serve", endpoint(port), server_secret, client_key, root, "run", issuer) as server:
         assert b"listening" in server.stderr.readline()
         wrong = capability[:-1] + ("a" if capability[-1] != "a" else "b")
@@ -257,6 +259,71 @@ def test_capabilities(base, root, server_secret, server_key, client_secret, clie
             assert cli("write", "inside", env=env, data=b"denied", check=False).returncode
             assert cli("run", "--", "/usr/bin/true", env=env, check=False).returncode
     print("signed scoped grant, wrong signature and symlink escape denial passed", flush=True)
+
+
+    env = {**env, "ECO_TEST_SECRET": "sandbox-fixture-secret"}
+    scope_grant = cli("grant", key_path, server_key, client_key, "rx", "60", "scope").stdout.decode().strip()
+    with background("serve", endpoint(port), server_secret, client_key, root, "run", issuer, env=env) as server:
+        assert b"listening" in server.stderr.readline()
+        if sys.platform == "linux" and env.get("ECO_ODIN_IO_URING") == "1":
+            assert select.select([server.stderr], [], [], 2)[0], "io_uring not reported by server"
+            assert b"io_uring ready" in server.stderr.readline()
+        local = base / "restricted"
+        scoped = {**env, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_CAPABILITY": scope_grant}
+        with background("client", local, endpoint(port), client_secret, server_key, env=scoped) as client:
+            wait_ready(local, client)
+            operation = cli("run", "--", "/bin/sh", "-c", "printf built > generated; cat generated", env=scoped, check=False)
+            if sys.platform != "linux":
+                assert operation.returncode != 0 and b"cannot enforce" in operation.stderr, operation
+            else:
+                assert (operation.returncode, operation.stdout) == (0, b"built"), operation
+                denied = cli("run", "--", "/bin/sh", "-c", "cat ../outside; printf no >> ../outside",
+                             env=scoped, check=False)
+                assert denied.returncode != 0 and denied.stdout == b""
+                assert (root / "outside").read_bytes() == b"disallowed"
+                denied = cli("run", "--", "/usr/bin/python3", "-c", "import socket; socket.socket()", env=scoped, check=False)
+                assert denied.returncode != 0 and b"PermissionError" in denied.stderr, denied
+                denied = cli("run", "--", "/bin/sh", "-c", 'test -z "$ECO_TEST_SECRET"', env=scoped, check=False)
+                assert denied.returncode == 0
+                job_id = cli("start", "--", "/bin/sh", "-c", "cat generated; cat ../outside",
+                             env=scoped).stdout.decode().strip()
+                job = cli("attach", job_id, env=scoped, check=False)
+                assert job.returncode != 0 and job.stdout == b"built"
+                assert b"Permission denied" in job.stderr
+    print("scoped process enforcement passed", flush=True)
+
+
+
+def test_bulk(base, root, server_secret, server_key, client_secret, client_key, env):
+    port = port_for(socket.SOCK_STREAM)
+    target = endpoint(port)
+    settings = {**env, "ECO_ODIN_BULK_TCP": "1", "ECO_ODIN_ADDR": target,
+                "ECO_ODIN_KEY": str(client_secret), "ECO_ODIN_PEER": server_key}
+    source, result = base / "bulk-source", base / "bulk-result"
+    data = os.urandom(3 * 1024 * 1024)
+    source.write_bytes(data)
+    with background("serve", target, server_secret, client_key, root, "write", env=settings) as server:
+        assert b"listening" in server.stderr.readline()
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+        cli("put", source, "bulk-fixture", env=settings)
+        cli("get", "bulk-fixture", result, env=settings)
+        assert result.read_bytes() == data
+        assert cli("get", "../server", result, env=settings, check=False).returncode
+        assert result.read_bytes() == data
+        wrong_client = base / "other-client"
+        cli("keygen", wrong_client)
+        wrong = {**settings, "ECO_ODIN_KEY": str(wrong_client)}
+        assert cli("put", source, "wrong", env=wrong, check=False).returncode
+        assert not (root / "wrong").exists()
+    portable = {**settings, "ECO_ODIN_BULK_CRYPTO": "portable"}
+    with background("serve", target, server_secret, client_key, root, "read", env=portable) as server:
+        ready = server.stderr.readline()
+        assert b"listening" in ready, ready
+        assert cli("put", source, "read-only", env=settings, check=False).returncode
+        cli("get", "bulk-fixture", result, env=settings)
+        assert result.read_bytes() == data
+    print("Noise TCP bulk file integrity, authenticated peer and access checks passed", flush=True)
 
 
 def test_jobs(stack, base, root, port, server_secret, client_secret, server_key, client_key, env):
@@ -302,6 +369,7 @@ def main():
             test_tunnels(env)
             test_faults(base, port, client_secret, server_key, env)
             test_capabilities(base, root, server_secret, server_key, client_secret, client_key, env)
+            test_bulk(base, root, server_secret, server_key, client_secret, client_key, env)
             test_jobs(stack, base, root, port, server_secret, client_secret, server_key, client_key, env)
 
 

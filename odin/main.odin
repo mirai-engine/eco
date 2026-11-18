@@ -303,6 +303,7 @@ command_cli :: proc(args: []string) -> int {
         op = .Read if command == "get" else .Write
         path, local = args[1], args[2]
         if op == .Write { path, local = local, path }
+        if bulk_enabled() { return bulk_client(op, path, local) }
     case:
         if len(args) != 2 { return error_exit(USAGE) }
         path = args[1]
@@ -410,6 +411,7 @@ command_cli :: proc(args: []string) -> int {
 
 main :: proc() {
     eco_install_signals()
+    load_bulk_limit()
     if len(os.args) < 2 { os.exit(error_exit(USAGE)) }
     args := os.args[1:]
     switch args[0] {
@@ -424,8 +426,8 @@ main :: proc() {
     case "grant":
         os.exit(issue_capability(args[1:]))
     case "job-worker":
-        if len(args) != 3 { os.exit(125) }
-        os.exit(job_worker(args[1], args[2]))
+        if len(args) != 5 || (args[2] != "path" && args[2] != "scope") { os.exit(125) }
+        os.exit(job_worker(args[1], args[3], args[4], args[2] == "scope"))
     case "forward", "forward-udp":
         if len(args) != 3 { os.exit(error_exit(USAGE)) }
         bind, bind_ok := net.parse_endpoint(args[1])
