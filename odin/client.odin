@@ -6,7 +6,11 @@ import "core:net"
 import "core:strings"
 import "core:time"
 
-foreign import platform "../.eco-deps/libeco_platform.a"
+when ODIN_OS == .Windows {
+    foreign import platform "../.eco-deps/eco_platform.lib"
+} else {
+    foreign import platform "../.eco-deps/libeco_platform.a"
+}
 
 @(default_calling_convention="c")
 foreign platform {
@@ -32,6 +36,7 @@ Local_Call :: struct {
 Bridge :: struct {
     endpoint: net.Endpoint,
     udp: net.UDP_Socket,
+    udp_fd: c.int,
     link: ^Link,
     serial, query_serial: u32,
     own: ^ecdh.Private_Key,
@@ -106,7 +111,7 @@ close_local :: proc(bridge: ^Bridge, slot: ^^Local_Call) {
 connect_bridge :: proc(bridge: ^Bridge) -> bool {
     if bridge.link != nil { return true }
     link := new(Link)
-    if !connect_link(bridge.udp, bridge.endpoint, bridge.own, bridge.peer, bridge.token, false, link) {
+    if !connect_link(bridge.udp, bridge.endpoint, bridge.own, bridge.peer, bridge.token, false, link, bridge.udp_fd) {
         free(link)
         return false
     }
@@ -239,33 +244,32 @@ forward_local :: proc(bridge: ^Bridge, call: ^Local_Call) -> bool {
 }
 
 client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public_Key, token: []byte) -> int {
-    end := strings.last_index_byte(path, '/')
-    if end <= 0 || end == len(path)-1 { return error_exit("socket must be inside an absolute private directory") }
-    dir := strings.clone_to_cstring(path[:end])
-    defer delete(dir)
-    if eco_check_private_dir(dir) != 1 { return error_exit("socket directory must be owned by you and mode 0700") }
-    lock_path := strings.concatenate({path, ".lock"})
-    defer delete(lock_path)
-    lock_name := strings.clone_to_cstring(lock_path)
-    defer delete(lock_name)
-    lock := eco_lock_local(lock_name)
-    if lock < 0 { return error_exit("another client daemon owns the socket") }
-    defer _ = eco_close(lock)
+    if !valid_local_path(path) { return error_exit("invalid or non-private IPC endpoint") }
+    lock: c.int = -1
+    when ODIN_OS != .Windows {
+        lock_path := strings.concatenate({path, ".lock"}, context.temp_allocator)
+        lock_name := strings.clone_to_cstring(lock_path, context.temp_allocator)
+        lock = eco_lock_local(lock_name)
+        if lock < 0 { return error_exit("another client daemon owns the socket") }
+    }
+    defer close_fd(&lock)
     name := strings.clone_to_cstring(path)
     defer delete(name)
-    if eco_prepare_socket(name) < 0 { return error_exit("cannot remove stale socket") }
+    if eco_prepare_socket(name) < 0 { return error_exit("cannot prepare IPC endpoint") }
     listener := eco_listen_local(name)
     if listener < 0 { return error_exit("cannot listen on the local socket") }
     defer _ = eco_unlink(name)
     defer _ = eco_close(listener)
     udp, err := net.make_unbound_udp_socket(family(endpoint))
     if err != nil { return error_exit("cannot open UDP", err) }
-    defer net.close(udp)
-    if eco_fd_setup(c.int(udp), 1) < 0 { return error_exit("cannot configure UDP socket") }
+    udp_fd := eco_socket_fd(uintptr(udp))
+    if udp_fd < 0 { net.close(udp); return error_exit("cannot register UDP socket") }
+    defer _ = eco_close(udp_fd)
+    if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
 
     _ = eco_ring_setup()
     defer eco_ring_close()
-    bridge := Bridge{endpoint = endpoint, udp = udp, own = own, peer = peer, idle = time.tick_now(), token = token}
+    bridge := Bridge{endpoint = endpoint, udp = udp, udp_fd = udp_fd, own = own, peer = peer, idle = time.tick_now(), token = token}
     defer {
         for &call in bridge.calls { close_local(&bridge, &call) }
         if bridge.link != nil { close_client_link(&bridge.link) }
@@ -293,7 +297,7 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
         }
 
         fds, events: [66]c.int
-        fds[0], events[0] = c.int(udp), POLL_READ
+        fds[0], events[0] = udp_fd, POLL_READ
         fds[1], events[1] = listener, POLL_READ
         count := 2
         active := false
@@ -348,4 +352,16 @@ close_client_link :: proc(slot: ^^Link) {
     link := slot^
     _ = send_record(link, .Close, []byte{0}, link.remote)
     free_link(slot)
+}
+
+valid_local_path :: proc(path: string) -> bool {
+    when ODIN_OS == .Windows {
+        return strings.has_prefix(path, `\\.\pipe\`) && len(path) > len(`\\.\pipe\`) &&
+               len(path) <= 240 && strings.index_byte(path, 0) < 0
+    } else {
+        end := strings.last_index_byte(path, '/')
+        if len(path) == 0 || path[0] != '/' || end <= 0 || end == len(path)-1 { return false }
+        dir := strings.clone_to_cstring(path[:end], context.temp_allocator)
+        return eco_check_private_dir(dir) == 1
+    }
 }

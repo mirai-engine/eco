@@ -8,7 +8,11 @@ import "core:crypto/noise"
 import "core:net"
 import "core:time"
 
-foreign import platform "../.eco-deps/libeco_platform.a"
+when ODIN_OS == .Windows {
+    foreign import platform "../.eco-deps/eco_platform.lib"
+} else {
+    foreign import platform "../.eco-deps/libeco_platform.a"
+}
 
 @(default_calling_convention="c")
 foreign platform {
@@ -16,6 +20,7 @@ foreign platform {
     eco_stopping :: proc() -> c.int ---
     eco_listening :: proc(port: c.int) ---
     eco_ring_ready :: proc() ---
+    eco_socket_fd :: proc(native: uintptr) -> c.int ---
     eco_wait :: proc(fd, timeout: c.int) -> c.int ---
     eco_fd_setup :: proc(fd, nonblock: c.int) -> c.int ---
     eco_poll :: proc(fds, events: [^]c.int, count, timeout: c.int) -> c.int ---
@@ -276,7 +281,7 @@ handle_path :: proc(link: ^Link, header: Record, from: net.Endpoint, plain: []by
 }
 
 connect_link :: proc(udp: net.UDP_Socket, endpoint: net.Endpoint, own: ^ecdh.Private_Key,
-                     peer: ^ecdh.Public_Key, token: []byte, early_ping: bool, link: ^Link) -> bool {
+                     peer: ^ecdh.Public_Key, token: []byte, early_ping: bool, link: ^Link, udp_fd: c.int) -> bool {
     sid: [8]byte
     random_bytes(sid[:])
     link.id = get_u64(sid[:]) | 1
@@ -302,7 +307,7 @@ connect_link :: proc(udp: net.UDP_Socket, endpoint: net.Endpoint, own: ^ecdh.Pri
             _, _ = net.send_udp(udp, link.client_hello[:link.hello_len], endpoint)
             retry = time.tick_now()
         }
-        if eco_wait(c.int(udp), 100) == 0 { continue }
+        if eco_wait(udp_fd, 100) == 0 { continue }
         n, from, err := net.recv_udp(udp, packet[:])
         if err != nil || !same_endpoint(from, endpoint) { continue }
         header, ok := parse_header(packet[:n])

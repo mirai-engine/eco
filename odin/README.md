@@ -147,7 +147,44 @@ respect the grant expiry. The job namespace binds to the client identity and gra
   Use detached jobs and their explicit IDs when restart recovery matters.
 
 The current implementation uses bounded copies in the framing and retransmission paths.
-Windows needs a separate backend for ConPTY, IOCP and Named Pipes.
+The Windows backend targets x64 Windows 10 version 1809 or newer, including Windows 11.
+Named Pipes use IOCP for asynchronous reads, writes and accepts. Winsock notifications wake
+the same completion loop. Windows uses ConPTY for terminal sessions and Job Objects to
+cancel process trees. Project-relative native file operations reject NTFS reparse points.
+Windows rejects execution grants scoped to a subdirectory. Landlock confinement is Linux-only.
+
+### Build and run on Windows
+
+Run the native build from an x64 Visual Studio developer shell with Odin, Git and a recent
+Windows SDK.
+
+```powershell
+.\odin\build-windows.ps1
+py -3 .\odin\windows_smoke.py
+```
+
+Cross-compile on macOS or Linux with a matching LLVM-MinGW UCRT toolchain.
+
+```sh
+./odin/build-windows-cross.sh /absolute/path/to/llvm-mingw/bin
+```
+
+Both builds produce `bin/eco-windows-amd64.exe`. On Windows, the default IPC endpoint is
+`\\.\pipe\eco-odin-<current-user-SID>`. For a second daemon, set `ECO_ODIN_SOCKET` to a
+different local pipe name, such as `\\.\pipe\eco-odin-work`. Set `ECO_ODIN_ADDR`,
+`ECO_ODIN_KEY`, and `ECO_ODIN_PEER` as on Unix. Key generation creates a private ACL.
+The job directory must be on NTFS and owned by the launching user with an ACL scoped to
+that user and trusted system administrators.
+
+```powershell
+.\bin\eco-windows-amd64.exe run -- cmd.exe /d /c ver
+.\bin\eco-windows-amd64.exe tty -- powershell.exe -NoLogo
+```
+
+Verification for this branch covers Windows x64 cross-compilation and PE imports. The
+Windows smoke suite is intended for a native host, where it exercises identity, IOCP
+IPC, binary I/O, ConPTY resize, reparse-point rejection, files over UDP and TCP, and
+reattaching to a detached job.
 
 ## Verify and measure
 

@@ -5,7 +5,11 @@ import "core:fmt"
 import "core:net"
 import "core:time"
 
-foreign import platform "../.eco-deps/libeco_platform.a"
+when ODIN_OS == .Windows {
+    foreign import platform "../.eco-deps/eco_platform.lib"
+} else {
+    foreign import platform "../.eco-deps/libeco_platform.a"
+}
 
 @(default_calling_convention="c")
 foreign platform {
@@ -183,11 +187,13 @@ forward :: proc(bind: net.Endpoint, target_text: string, datagram: bool) -> int 
     if datagram {
         socket, err := net.make_bound_udp_socket(bind.address, bind.port)
         if err != nil { return error_exit("cannot listen for UDP forward", err) }
-        udp, service = socket, c.int(socket)
+        udp, service = socket, eco_socket_fd(uintptr(socket))
+        if service < 0 { net.close(socket); return error_exit("cannot register UDP socket") }
     } else {
         socket, err := net.listen_tcp(bind, STREAM_MAX)
         if err != nil { return error_exit("cannot listen for TCP forward", err) }
-        tcp, service = socket, c.int(socket)
+        tcp, service = socket, eco_socket_fd(uintptr(socket))
+        if service < 0 { net.close(socket); return error_exit("cannot register TCP socket") }
     }
     defer _ = eco_close(service)
     if eco_fd_setup(service, 1) < 0 { return error_exit("cannot configure local forward") }
@@ -222,7 +228,8 @@ forward :: proc(bind: net.Endpoint, target_text: string, datagram: bool) -> int 
                 if relay != nil { continue }
                 socket, _, err := net.accept_tcp(tcp)
                 if err != nil { break }
-                fd := c.int(socket)
+                fd := eco_socket_fd(uintptr(socket))
+                if fd < 0 { net.close(socket); continue }
                 if eco_fd_setup(fd, 1) < 0 { _ = eco_close(fd); continue }
                 relay = new_relay(fd, target_text)
                 if relay == nil { _ = eco_close(fd); continue }

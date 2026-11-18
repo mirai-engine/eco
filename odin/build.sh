@@ -18,6 +18,8 @@ dependency() {
 dependency blake3 https://github.com/mirai-engine/odin-blake3.git d937acf940a85fa26b2ec207df51b9bda04f6c20
 dependency kcp https://github.com/skywind3000/kcp.git b1a7a2101dcbb96017681a500d6b82bbe5a88766
 
+if [ "${1:-}" = deps ]; then exit 0; fi
+
 "${CC:-cc}" -O3 -c .eco-deps/kcp/ikcp.c -o .eco-deps/ikcp.o
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Wno-deprecated-declarations -O2 -c odin/platform.c -o .eco-deps/platform.o
 linux_flags=

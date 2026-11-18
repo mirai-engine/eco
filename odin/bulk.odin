@@ -12,7 +12,11 @@ import "core:strings"
 import "core:time"
 import "deps:blake3"
 
-foreign import platform "../.eco-deps/libeco_platform.a"
+when ODIN_OS == .Windows {
+    foreign import platform "../.eco-deps/eco_platform.lib"
+} else {
+    foreign import platform "../.eco-deps/libeco_platform.a"
+}
 @(default_calling_convention="c")
 foreign platform {
     eco_bulk_socket :: proc(fd: c.int) -> c.int ---
@@ -38,6 +42,7 @@ Bulk_Pending :: struct {
 }
 Bulk_Server :: struct {
     listener: net.TCP_Socket,
+    listen_fd: c.int,
     enabled: bool,
     pending: [BULK_PEERS]Bulk_Pending,
     workers: [BULK_PEERS]c.int,
@@ -46,11 +51,10 @@ Bulk_Server :: struct {
 enable_bulk :: proc(endpoint: net.Endpoint, b: ^Bulk_Server) -> bool {
     sock, err := net.listen_tcp(endpoint, BULK_PEERS)
     if err != nil { return false }
-    if eco_fd_setup(c.int(sock), 1) < 0 {
-        net.close(sock)
-        return false
-    }
-    b.enabled, b.listener = true, sock
+    fd := eco_socket_fd(uintptr(sock))
+    if fd < 0 { net.close(sock); return false }
+    if eco_fd_setup(fd, 1) < 0 { _ = eco_close(fd); return false }
+    b.enabled, b.listener, b.listen_fd = true, sock, fd
     for &p in b.pending { p.fd, p.scope = -1, -1 }
     return true
 }
@@ -59,7 +63,7 @@ clear_bulk :: proc(b: ^Bulk_Server) {
     if !b.enabled { return }
     for &p in b.pending { close_bulk_pending(&p) }
     for pid in b.workers { if pid > 0 { eco_child_kill(pid) } }
-    net.close(b.listener)
+    _ = eco_close(b.listen_fd)
 }
 
 bulk_enabled :: proc() -> bool {
@@ -278,9 +282,14 @@ poll_bulk_peer :: proc(server: ^Server, p: ^Bulk_Pending, worker: ^c.int) -> boo
     crypto.zero_explicit(raw_data(confirmation), len(confirmation))
     noise.cipherstates_reset(&p.cipher)
 
-    pid := eco_bulk_worker(p.fd, p.scope)
-    if pid == 0 { bulk_serve_worker(p, server.access) }
-    if pid > 0 { worker^ = pid }
+    when ODIN_OS == .Windows {
+        worker^ = start_windows_bulk(p, server.access)
+        if worker^ > 0 { p.fd = -1 }
+    } else {
+        pid := eco_bulk_worker(p.fd, p.scope)
+        if pid == 0 { bulk_serve_worker(p, server.access) }
+        if pid > 0 { worker^ = pid }
+    }
     return false
 }
 
@@ -295,7 +304,8 @@ poll_bulk :: proc(b: ^Bulk_Server, server: ^Server, fds, events: []c.int, count:
         if p.fd < 0 {
             socket, _, err := net.accept_tcp(b.listener)
             if err != nil { continue }
-            p.fd = c.int(socket)
+            p.fd = eco_socket_fd(uintptr(socket))
+            if p.fd < 0 { net.close(socket); continue }
             if eco_fd_setup(p.fd, 1) < 0 { close_bulk_pending(&p); continue }
             p.start, p.used, p.sent, p.welcome_length = time.tick_now(), 0, 0, 0
         }
@@ -310,7 +320,7 @@ poll_bulk :: proc(b: ^Bulk_Server, server: ^Server, fds, events: []c.int, count:
         count^ += 1
         timeout^ = min(timeout^, 100)
     }
-    fds[count^], events[count^] = c.int(b.listener), POLL_READ
+    fds[count^], events[count^] = b.listen_fd, POLL_READ
     count^ += 1
 }
 

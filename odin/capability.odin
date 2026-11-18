@@ -48,6 +48,10 @@ read_private_seed :: proc(path: string, bytes: []byte) -> bool {
 }
 
 create_seed :: proc(path: string, bytes: []byte) -> bool {
+    when ODIN_OS == .Windows {
+        name := strings.clone_to_cstring(path, context.temp_allocator)
+        return eco_make_private(name, raw_data(bytes), c.int(len(bytes))) == 0
+    }
     file, err := os.open(path, {.Write, .Create, .Excl}, {.Read_User, .Write_User})
     if err != nil { return false }
     n, write_err := os.write(file, bytes)

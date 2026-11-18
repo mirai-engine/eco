@@ -61,6 +61,8 @@ int eco_wait(int fd, int timeout) {
     return result > 0 && (p.revents & POLLIN) != 0;
 }
 
+int eco_socket_fd(uintptr_t socket) { return (int)socket; }
+
 int eco_fd_setup(int fd, int nonblock) {
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) return -1;
     if (!nonblock) return 0;

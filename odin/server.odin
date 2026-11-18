@@ -532,8 +532,10 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public
     defer _ = eco_close(fd)
     udp, err := net.make_bound_udp_socket(endpoint.address, endpoint.port)
     if err != nil { return error_exit("cannot listen on UDP", err) }
-    defer net.close(udp)
-    if eco_fd_setup(c.int(udp), 1) < 0 { return error_exit("cannot configure UDP socket") }
+    udp_fd := eco_socket_fd(uintptr(udp))
+    if udp_fd < 0 { net.close(udp); return error_exit("cannot register UDP socket") }
+    defer _ = eco_close(udp_fd)
+    if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
     server := Server{udp = udp, own = own^, peer = peer^, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
     bulk: Bulk_Server
     if bulk_enabled() && !enable_bulk(endpoint, &bulk) { return error_exit("cannot listen for bulk TCP") }
@@ -558,7 +560,7 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public
         }
         timeout: c.int = 1000
         fds, events: [66]c.int
-        fds[0], events[0] = c.int(udp), POLL_READ
+        fds[0], events[0] = udp_fd, POLL_READ
         fds[1], events[1] = children, POLL_READ
         count := 2
         poll_bulk(&bulk, &server, fds[:], events[:], &count, &timeout)

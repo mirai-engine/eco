@@ -6,7 +6,11 @@ import "core:crypto/aes"
 import "core:crypto/hkdf"
 import "core:os"
 
-foreign import platform "../.eco-deps/libeco_platform.a"
+when ODIN_OS == .Windows {
+    foreign import platform "../.eco-deps/eco_platform.lib"
+} else {
+    foreign import platform "../.eco-deps/libeco_platform.a"
+}
 @(default_calling_convention="c")
 foreign platform {
     eco_aes_context :: proc(key: ^byte, encrypt: c.int) -> rawptr ---

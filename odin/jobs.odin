@@ -10,7 +10,11 @@ import "core:strconv"
 import "core:time"
 import "deps:blake3"
 
-foreign import platform "../.eco-deps/libeco_platform.a"
+when ODIN_OS == .Windows {
+    foreign import platform "../.eco-deps/eco_platform.lib"
+} else {
+    foreign import platform "../.eco-deps/libeco_platform.a"
+}
 
 @(default_calling_convention="c")
 foreign platform {

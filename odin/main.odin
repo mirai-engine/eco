@@ -79,7 +79,7 @@ dispatch_platform :: proc(args: []string) -> int {
     defer ecdh.private_key_clear(&own)
     peer: ecdh.Public_Key
     if !load_keys(args[2+shift], args[3+shift], &own, &peer) {
-        return error_exit("invalid identity or peer. Identity must be a regular 0600 file")
+        return error_exit("invalid identity or peer. Identity must be a private regular file")
     }
     token: []byte
     if role != "serve" {
@@ -115,8 +115,8 @@ dispatch_platform :: proc(args: []string) -> int {
         jobs := os.get_env(jobs_buffer[:], "ECO_ODIN_JOBS")
         if jobs != "" {
             name := strings.clone_to_cstring(jobs, context.temp_allocator)
-            if jobs[0] != '/' || eco_check_private_dir(name) != 1 {
-                return error_exit("ECO_ODIN_JOBS must be an absolute, mode 0700 directory owned by you")
+            if !(os.is_absolute_path(jobs)) || eco_check_private_dir(name) != 1 {
+                return error_exit("ECO_ODIN_JOBS must be an absolute, private directory owned by you")
             }
         }
         return serve(endpoint, &own, &peer, args[4], access, policy, jobs)
@@ -125,11 +125,14 @@ dispatch_platform :: proc(args: []string) -> int {
     case "ping-early":
         udp, err := net.make_unbound_udp_socket(family(endpoint))
         if err != nil { return error_exit("cannot open UDP", err) }
-        defer net.close(udp)
+        udp_fd := eco_socket_fd(uintptr(udp))
+        if udp_fd < 0 { net.close(udp); return error_exit("cannot register UDP socket") }
+        defer _ = eco_close(udp_fd)
+        if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
         link := new(Link)
         defer free_link(&link)
         start := time.tick_now()
-        if !connect_link(udp, endpoint, &own, &peer, token, true, link) {
+        if !connect_link(udp, endpoint, &own, &peer, token, true, link, udp_fd) {
             return error_exit("cannot establish Noise session")
         }
         fmt.printfln("pong %v", time.tick_since(start))
@@ -141,6 +144,9 @@ dispatch_platform :: proc(args: []string) -> int {
 dial_local :: proc() -> c.int {
     sock_buffer: [1024]byte
     path := os.get_env(sock_buffer[:], "ECO_ODIN_SOCKET")
+    when ODIN_OS == .Windows {
+        if path == "" { path = default_pipe_name() }
+    }
     if path == "" {
         directory, err := os.user_home_dir(context.temp_allocator)
         if err != nil { return -1 }
@@ -148,11 +154,8 @@ dial_local :: proc() -> c.int {
         _ = os.mkdir(private_dir, {.Read_User, .Write_User, .Execute_User})
         path = fmt.tprintf("%s/socket", private_dir)
     }
-    end := strings.last_index_byte(path, '/')
-    if len(path) == 0 || path[0] != '/' || end <= 0 || end == len(path)-1 { return -1 }
+    if !valid_local_path(path) { return -1 }
     name := strings.clone_to_cstring(path, context.temp_allocator)
-    dir := strings.clone_to_cstring(path[:end], context.temp_allocator)
-    if eco_check_private_dir(dir) != 1 { return -1 }
     fd := eco_connect_local(name)
     if fd >= 0 { return fd }
 
