@@ -35,7 +35,7 @@ without copying keys:
 # Server, with native read/write, command execution, PTY and forwarding enabled
 mkdir -m 700 "$HOME/.eco-odin-jobs"
 ECO_ODIN_JOBS="$HOME/.eco-odin-jobs" \
-  bin/eco-odin serve 192.0.2.10:8443 server.key clients /path/to/repo run --pair
+  bin/eco-odin serve 192.0.2.10:8443 server.key clients /path/to/repo run
 
 # Client
 export ECO_ODIN_ADDR=192.0.2.10:8443
@@ -46,13 +46,16 @@ bin/eco-odin ping
 
 Both screens show the same verification code, for example `0346-9283`. It is derived from the
 transcript of a `Noise_XX` handshake, which binds both static keys, so a machine in the middle
-makes the two codes differ. Compare them and answer `y` or `n` in the server's terminal; the
-request waits five minutes. On approval the server appends the client to `CLIENTS` and the client
-stores the server key under its address in `ECO_ODIN_HOME/known_servers` (`~/.eco-odin` by
-default), which later commands use for that `ECO_ODIN_ADDR`; `ECO_ODIN_PEER` pins a key instead.
-The server handles one request at a time and refuses pairing after five denied or expired
-requests until it restarts. The code has 8 digits; answer only a request you expect. Restart the
-server without `--pair` once every machine is paired.
+makes the two codes differ. A running server always accepts requests and asks its operator: on
+Windows and macOS a dialog in the operator's session shows the client's name, address and code,
+with No as the default; on Linux the server's terminal asks `y` or `n`. A request expires after
+five minutes. On approval the server appends the client to `CLIENTS` and the client stores the
+server key under its address in `ECO_ODIN_HOME/known_servers` (`~/.eco-odin` by default), which
+later commands use for that `ECO_ODIN_ADDR`; `ECO_ODIN_PEER` pins a key instead.
+
+Any machine that reaches the port can raise a request, so approve only one you expect and whose
+code matches. The server handles one request at a time and, after five denied or expired requests
+in a row, ignores new ones for ten minutes. The code has 8 digits.
 
 The client starts its daemon on demand and exits it after two minutes without local calls.
 Alternatively, run `eco-odin client SOCKET UDP KEY PEER` in the foreground. Use a separate
@@ -195,7 +198,7 @@ that user and trusted system administrators.
 
 The Windows smoke suite runs on a native host. It exercises identity, IOCP IPC, binary I/O,
 ConPTY resize, reparse-point rejection, files over UDP and TCP, forwarding, reattaching to a
-detached job, and pairing with denial, approval and revocation.
+detached job, and pairing through the approval dialog with denial, approval and revocation.
 
 ## Verify and measure
 

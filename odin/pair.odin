@@ -23,12 +23,13 @@ PAIR_WAIT :: 5*time.Minute
 PAIR_HANDSHAKE :: 5*time.Second
 PAIR_LINGER :: 10*time.Second
 PAIR_FAILURES :: 5
+PAIR_COOLDOWN :: 10*time.Minute
 PAIR_LABEL_MAX :: 64
 TRUST_FILE_MAX :: 1 << 20
 
 Pair_Status :: enum u8 { Pending, Approved, Denied }
 
-Pair_Answer :: enum i32 { None, Yes, No, Other }
+Pair_Answer :: enum i64 { None, Yes, No, Other }
 
 Pairing :: struct {
     id, send_number: u64,
@@ -38,15 +39,27 @@ Pairing :: struct {
     first: [PAIR_FIRST]byte,
     reply: [PAIR_REPLY]byte,
     final: [MAX_PACKET]byte,
-    final_len, label_len, failures: int,
+    final_len, label_len, title_len, failures: int,
     client: [32]byte,
     label: [PAIR_LABEL_MAX]byte,
     code: [9]byte,
-    started, resolved: time.Tick,
+    title: [32]byte,
+    started, resolved, locked: time.Tick,
     active, completed: bool,
     status: Pair_Status,
-    // Written by the console thread, consumed by the server loop.
-    answer: i32,
+    // Numbers each completed request; approval threads read it atomically.
+    serial: i64,
+    // serial << 8 | Pair_Answer, written by an approval thread and consumed by the server loop,
+    // so an answer to an expired request never approves a later one.
+    answer: i64,
+}
+
+Pair_Prompt :: struct {
+    pairing: ^Pairing,
+    serial: i64,
+    title: [32]byte,
+    text: [256]byte,
+    title_len, text_len: int,
 }
 
 eco_home :: proc() -> string {
@@ -164,6 +177,44 @@ pair_code :: proc(transcript: []byte) -> (code: [9]byte) {
     return
 }
 
+post_pair_answer :: proc(pairing: ^Pairing, serial: i64, answer: Pair_Answer) {
+    sync.atomic_store(&pairing.answer, serial << 8 | i64(answer))
+}
+
+when ODIN_OS != .Linux {
+    pair_prompt_thread :: proc(data: rawptr) {
+        prompt := cast(^Pair_Prompt)data
+        defer free(prompt)
+        answer := ask_pair_approval(string(prompt.title[:prompt.title_len]), string(prompt.text[:prompt.text_len]))
+        post_pair_answer(prompt.pairing, prompt.serial, answer)
+    }
+}
+
+// Linux servers have no common desktop to ask in, so the operator answers in the server's
+// terminal; Windows and macOS show a dialog in the operator's session.
+start_pair_approval :: proc(p: ^Pairing) -> bool {
+    fmt.printfln("eco-odin: pairing request from %s at %v with code %s%s", string(p.label[:p.label_len]),
+                 net.endpoint_to_string(p.remote, context.temp_allocator), string(p.code[:]),
+                 ". Approve? [y/n]" when ODIN_OS == .Linux else "")
+    when ODIN_OS == .Linux {
+        return true
+    } else {
+        text := fmt.tprintf("%s at %s wants to pair with this computer and run commands as you.\n\nCode: %s\n\nApprove only if the other screen shows the same code.",
+                            string(p.label[:p.label_len]), net.endpoint_to_string(p.remote, context.temp_allocator),
+                            string(p.code[:]))
+        prompt := new(Pair_Prompt)
+        if prompt == nil { return false }
+        prompt.pairing, prompt.serial = p, p.serial
+        prompt.title_len = copy(prompt.title[:], p.title[:p.title_len])
+        prompt.text_len = copy(prompt.text[:], text)
+        if thread.create_and_start_with_data(prompt, pair_prompt_thread, self_cleanup = true) == nil {
+            free(prompt)
+            return false
+        }
+        return true
+    }
+}
+
 pair_console :: proc(data: rawptr) {
     pairing := cast(^Pairing)data
     buffer: [256]byte
@@ -179,7 +230,7 @@ pair_console :: proc(data: rawptr) {
             answer := Pair_Answer.Other
             if strings.equal_fold(word, "y") || strings.equal_fold(word, "yes") { answer = .Yes }
             if strings.equal_fold(word, "n") || strings.equal_fold(word, "no") { answer = .No }
-            sync.atomic_store(&pairing.answer, i32(answer))
+            post_pair_answer(pairing, sync.atomic_load(&pairing.serial), answer)
             copy(buffer[:], buffer[newline+1:used])
             used -= newline+1
         }
@@ -194,9 +245,10 @@ start_pair_console :: proc(pairing: ^Pairing) -> bool {
 reset_pairing :: proc(p: ^Pairing) {
     noise.handshake_reset(&p.handshake)
     noise.cipherstates_reset(&p.cipher)
-    failures := p.failures
+    failures, locked, serial := p.failures, p.locked, p.serial
     p^ = {}
-    p.failures = failures
+    p.failures, p.locked = failures, locked
+    sync.atomic_store(&p.serial, serial)
 }
 
 send_pair_status :: proc(udp: net.UDP_Socket, p: ^Pairing) {
@@ -209,12 +261,6 @@ send_pair_status :: proc(udp: net.UDP_Socket, p: ^Pairing) {
         return
     }
     _, _ = net.send_udp(udp, packet[:], p.remote)
-}
-
-print_pair_prompt :: proc(p: ^Pairing) {
-    fmt.printfln("eco-odin: pairing request from %s at %v with code %s. Approve? [y/n]",
-                 string(p.label[:p.label_len]), net.endpoint_to_string(p.remote, context.temp_allocator),
-                 string(p.code[:]))
 }
 
 receive_pair :: proc(server: ^Server, packet: []byte, header: Record, from: net.Endpoint) {
@@ -230,7 +276,10 @@ receive_pair :: proc(server: ^Server, packet: []byte, header: Record, from: net.
             // A resolved request lingers only to report its outcome; a new one replaces it.
             if !p.completed || p.status == .Pending { return }
         }
-        if p.failures >= PAIR_FAILURES { return }
+        if p.failures >= PAIR_FAILURES {
+            if time.tick_since(p.locked) < PAIR_COOLDOWN { return }
+            p.failures = 0
+        }
         reset_pairing(p)
         if noise.handshake_init(&p.handshake, false, packet[:16], &server.own, nil, PAIR_SUITE) != .Ok { return }
         empty: [1]byte
@@ -275,8 +324,9 @@ receive_pair :: proc(server: ^Server, packet: []byte, header: Record, from: net.
     p.label_len = clean_label(payload, p.label[:])
     p.final_len = copy(p.final[:], packet)
     p.completed, p.started = true, time.tick_now()
-    _ = sync.atomic_exchange(&p.answer, i32(Pair_Answer.None))
-    print_pair_prompt(p)
+    sync.atomic_store(&p.serial, p.serial+1)
+    p.title_len = len(fmt.bprintf(p.title[:], "eco pairing %s", string(p.code[:])))
+    if !start_pair_approval(p) { p.status, p.resolved = .Denied, time.tick_now() }
     send_pair_status(server.udp, p)
 }
 
@@ -291,13 +341,14 @@ tick_pair :: proc(server: ^Server) {
         if time.tick_since(p.resolved) >= PAIR_LINGER { reset_pairing(p) }
         return
     }
-    answer := Pair_Answer(sync.atomic_exchange(&p.answer, i32(Pair_Answer.None)))
+    posted := sync.atomic_exchange(&p.answer, 0)
+    answer := Pair_Answer(posted & 0xff) if posted >> 8 == p.serial else .None
     switch {
     case answer == .Yes:
         client := string(hex.encode(p.client[:], context.temp_allocator))
         line := fmt.tprintf("%s %s", client, string(p.label[:p.label_len]))
         if store_trust(server.clients, client, line) {
-            p.status = .Approved
+            p.status, p.failures = .Approved, 0
             fmt.printfln("eco-odin: paired %s", string(p.label[:p.label_len]))
         } else {
             p.status = .Denied
@@ -312,11 +363,15 @@ tick_pair :: proc(server: ^Server) {
     case time.tick_since(p.started) >= PAIR_WAIT:
         p.status = .Denied
         p.failures += 1
+        when ODIN_OS != .Linux { close_pair_approval(string(p.title[:p.title_len])) }
         fmt.println("eco-odin: pairing request timed out")
     }
     if p.status != .Pending {
         p.resolved = time.tick_now()
-        if p.failures >= PAIR_FAILURES { fmt.println("eco-odin: pairing locked until the server restarts") }
+        if p.failures >= PAIR_FAILURES {
+            p.locked = p.resolved
+            fmt.println("eco-odin: pairing paused for ten minutes after repeated denials")
+        }
     }
 }
 
@@ -378,7 +433,7 @@ pair_client :: proc(address: string, name: string) -> int {
             noise.handshake_reset(&candidate)
         }
     }
-    if !replied { return error_exit("no pairing reply; start the server with --pair") }
+    if !replied { return error_exit("no pairing reply; check the address, that the server runs and that its firewall admits UDP") }
 
     label: [PAIR_LABEL_MAX]byte
     label_len := clean_label(transmute([]byte)name, label[:])
@@ -426,7 +481,7 @@ pair_client :: proc(address: string, name: string) -> int {
             fmt.printfln("paired with %s, server key %s", address, key)
             return 0
         case .Denied:
-            return error_exit("pairing denied, timed out or locked on the server")
+            return error_exit("pairing denied, expired or paused on the server")
         case:
             return error_exit("invalid pairing reply")
         }

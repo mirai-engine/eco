@@ -22,7 +22,6 @@ Server :: struct {
     own: ecdh.Private_Key,
     // File of authorized client keys, read on every handshake so a removed line revokes at once.
     clients: string,
-    // Present only while the server accepts pairing requests.
     pairing: ^Pairing,
     access: Access,
     policy: Policy,
@@ -495,7 +494,7 @@ receive_server :: proc(server: ^Server, packet, scratch: []byte, from: net.Endpo
     header, ok := parse_header(packet)
     if !ok { return }
     if header.kind == .Pair {
-        if server.pairing != nil { receive_pair(server, packet, header, from) }
+        receive_pair(server, packet, header, from)
         return
     }
     for link in server.links {
@@ -531,7 +530,7 @@ receive_server :: proc(server: ^Server, packet, scratch: []byte, from: net.Endpo
 }
 
 serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
-              root: string, access: Access, policy: Policy, jobs: string, pair: bool) -> int {
+              root: string, access: Access, policy: Policy, jobs: string) -> int {
     root_c := strings.clone_to_cstring(root)
     defer delete(root_c)
     fd := eco_root(root_c)
@@ -544,14 +543,13 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
     defer _ = eco_close(udp_fd)
     if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
     server := Server{udp = udp, own = own^, clients = clients, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
-    if pair {
-        server.pairing = new(Pairing)
-        if server.pairing == nil || !start_pair_console(server.pairing) {
-            return error_exit("cannot read pairing answers from the console")
-        }
+    // Not freed: approval threads may still post answers into it until the process exits.
+    server.pairing = new(Pairing)
+    if server.pairing == nil { return error_exit("out of memory") }
+    defer reset_pairing(server.pairing)
+    when ODIN_OS == .Linux {
+        if !start_pair_console(server.pairing) { return error_exit("cannot read pairing answers from the console") }
     }
-    // Not freed: the console thread keeps writing answers into it until the process exits.
-    defer if server.pairing != nil { reset_pairing(server.pairing) }
     bulk: Bulk_Server
     if bulk_enabled() && !enable_bulk(endpoint, &bulk) { return error_exit("cannot listen for bulk TCP") }
     defer clear_bulk(&bulk)
@@ -574,7 +572,7 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
             receive_server(&server, buffer[:n], scratch[:], from)
         }
         timeout: c.int = 1000
-        if server.pairing != nil && server.pairing.active {
+        if server.pairing.active {
             tick_pair(&server)
             timeout = 100
         }

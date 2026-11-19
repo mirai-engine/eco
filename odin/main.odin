@@ -15,9 +15,9 @@ import "deps:blake3"
 
 USAGE :: `usage: eco-odin COMMAND
   keygen KEY                         create a 0600 X25519 key and print its public key
-  serve UDP KEY CLIENTS ROOT [read|write|run|tunnel] [ISSUER_PUBLIC_KEY] [--pair]
-                                     CLIENTS lists authorized client keys; --pair adds clients
-  pair UDP [NAME]                    trust a server started with --pair, using ECO_ODIN_KEY
+  serve UDP KEY CLIENTS ROOT [read|write|run|tunnel] [ISSUER_PUBLIC_KEY]
+                                     CLIENTS lists authorized client keys; approved pairings add to it
+  pair UDP [NAME]                    pair with a server using ECO_ODIN_KEY; its operator approves
   issuer-keygen KEY
   grant ISSUER_KEY SERVER_KEY CLIENT_KEY RWXT TTL_SECONDS PATH
   client SOCKET UDP KEY PEER         keep a client daemon in the foreground
@@ -73,10 +73,7 @@ load_keys :: proc(path, peer_text: string, key: ^ecdh.Private_Key, peer: ^ecdh.P
            ecdh.public_key_set_bytes(peer, .X25519, bytes[:])
 }
 
-dispatch_platform :: proc(arguments: []string) -> int {
-    args := arguments
-    pair := args[0] == "serve" && args[len(args)-1] == "--pair"
-    if pair { args = args[:len(args)-1] }
+dispatch_platform :: proc(args: []string) -> int {
     role := args[0]
     count := 4 if role == "ping-early" else 5
     if len(args) < count || len(args) > count+2 || (role != "serve" && len(args) != count) {
@@ -131,7 +128,7 @@ dispatch_platform :: proc(arguments: []string) -> int {
                 return error_exit("ECO_ODIN_JOBS must be an absolute, private directory owned by you")
             }
         }
-        return serve(endpoint, &own, args[3], args[4], access, policy, jobs, pair)
+        return serve(endpoint, &own, args[3], args[4], access, policy, jobs)
     case "client":
         return client_daemon(args[1], endpoint, &own, &peer, token)
     case "ping-early":

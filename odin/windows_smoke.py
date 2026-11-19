@@ -36,6 +36,13 @@ if sys.platform == "win32":
     kernel.TerminateProcess.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.restype = wintypes.BOOL
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user.FindWindowW.restype = wintypes.HWND
+    user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user.PostMessageW.restype = wintypes.BOOL
+
+WM_COMMAND, IDYES, IDNO = 0x0111, 6, 7
 
 
 def await_pipe(name, process):
@@ -197,8 +204,8 @@ def check_pairing(binary, base, run, root):
            "ECO_ODIN_ADDR": address, "ECO_ODIN_SOCKET": r"\\.\pipe\eco-win-pair-" + uuid.uuid4().hex}
     for name in ("ECO_ODIN_PEER", "ECO_ODIN_CAPABILITY", "ECO_ODIN_BULK_TCP"):
         env.pop(name, None)
-    server = subprocess.Popen([binary, "serve", address, server_key, clients, root, "read", "--pair"],
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    server = subprocess.Popen([binary, "serve", address, server_key, clients, root, "read"],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     lines = queue.Queue()
     threading.Thread(target=lambda: [lines.put(line) for line in server.stdout], daemon=True).start()
 
@@ -209,28 +216,28 @@ def check_pairing(binary, base, run, root):
             if text in line:
                 return line
 
-    def request(answers):
+    def request(button):
         client = subprocess.Popen([binary, "pair", address, "laptop"], env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        prompt = server_line("pairing request from laptop")
-        shown = client.stdout.readline().decode()
-        code = prompt.split("code ")[1].split(".")[0]
-        assert shown.startswith(f"verification code {code};"), (prompt, shown)
-        for answer, reply in answers:
-            server.stdin.write(answer)
-            server.stdin.flush()
-            if reply:
-                server_line(reply)
+        logged = server_line("pairing request from laptop")
+        code = client.stdout.readline().decode().removeprefix("verification code ").split(";")[0]
+        assert logged.rstrip().endswith(f"with code {code}"), (logged, code)
+        # The dialog's title carries the server's code, so finding it proves both codes match.
+        title, deadline = f"eco pairing {code}", time.monotonic() + 10
+        while not (dialog := user.FindWindowW(None, title)):
+            assert time.monotonic() < deadline, f"no dialog titled {title}"
+            time.sleep(0.05)
+        assert user.PostMessageW(dialog, WM_COMMAND, button, 0)
         output, error = client.communicate(timeout=10)
         return client.returncode, output, error
 
     try:
         server_line("listening")
         assert run("ping", env=env, checked=False).returncode != 0  # Unknown server.
-        status, _, error = request([(b"n\n", None)])
+        status, _, error = request(IDNO)
         assert status != 0 and b"denied" in error, error
         assert not clients.exists()
-        status, output, error = request([(b"maybe\n", "answer y or n"), (b"y\n", None)])
+        status, output, error = request(IDYES)
         assert status == 0, error
         assert server_public.encode() in output, output
         assert clients.read_text().split()[0] == client_public
