@@ -202,17 +202,20 @@ int eco_listen_local(const char *name) {
     return fd;
 }
 
-int eco_connect_local(const char *name) {
+static int connect_local(const char *name, int nonblock) {
     struct sockaddr_un address;
     if (unix_address(&address, name) < 0) return -1;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
-    if (eco_fd_setup(fd, 0) < 0 || connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    if (eco_fd_setup(fd, nonblock) < 0 || connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         close(fd);
         return -1;
     }
     return fd;
 }
+
+int eco_connect_local(const char *name) { return connect_local(name, 0); }
+int eco_try_connect_local(const char *name) { return connect_local(name, 1); }
 
 int eco_accept_local(int listener) {
     int fd = accept(listener, NULL, NULL);

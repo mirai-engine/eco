@@ -3,6 +3,19 @@ set -eu
 cd "$(dirname "$0")/.."
 mkdir -p .eco-deps bin
 
+if [ "${1:-}" = desktop ]; then
+    if [ "$(uname -s)" != Darwin ]; then
+        echo "the desktop helper requires macOS 14 or newer" >&2
+        exit 1
+    fi
+    "${CC:-cc}" -mmacosx-version-min=14.0 -std=c11 -O2 -c odin/platform.c -o .eco-deps/desktop-platform.o
+    "${CC:-cc}" -mmacosx-version-min=14.0 -std=c11 -O2 -c odin/platform_linux.c -o .eco-deps/desktop-linux.o
+    shift
+    exec swiftc -O -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+        -import-objc-header odin/desktop_ipc.h odin/desktop_macos.swift \
+        .eco-deps/desktop-platform.o .eco-deps/desktop-linux.o -o bin/eco-desktop "$@"
+fi
+
 dependency() {
     name=$1 url=$2 revision=$3
     dir=".eco-deps/$name"

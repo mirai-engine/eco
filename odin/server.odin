@@ -12,6 +12,7 @@ import "deps:blake3"
 Op :: enum u8 {
     Ping = 1, Stat, List, Read, Write, Hash, Watch, Run, Tty, Tcp, Udp, Start, Attach, Jobs, Kill,
     Upload = 16, Commit, Cancel, Touch, Input, Input_End, Resize, Session,
+    Desktop_Capture = 24, Desktop_Stream, Desktop_Input,
     Stdout = 32, Stderr, Entry, Info, Digest, Done, Failure, Ready, Output_End,
 }
 
@@ -27,6 +28,8 @@ Server :: struct {
     policy: Policy,
     root: c.int,
     root_path, jobs: string,
+    desktop_socket: cstring,
+    desktop_stream: ^Stream,
     links: [16]^Link,
     rate_at: time.Tick,
     handshakes: int,
@@ -47,6 +50,7 @@ Server_Call :: struct {
     size, stamp: u64,
     kind: u8,
     exit_code: c.int,
+    desktop: ^Desktop_Call,
     job_path: string,
     job_output: [2]^os.File,
 }
@@ -80,6 +84,7 @@ dispose_call :: proc(call: ^Server_Call) {
     if call == nil { return }
     if call.pid > 0 { eco_child_kill(call.pid) }
     if call.directory != nil { eco_dir_close(call.directory) }
+    if call.desktop != nil { dispose_desktop(call.desktop) }
     for file in call.job_output { if file != nil { _ = os.close(file) } }
     if call.job_path != "" { delete(call.job_path) }
     close_fd(&call.input)
@@ -231,6 +236,10 @@ open_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message:
     if call.op == .Run || call.op == .Tty {
         if server.access != .Run || stream.link.rights & CAP_RUN == 0 { fail_call(stream, call, "execution is disabled"); return }
         open_run(stream, call, body)
+        return
+    }
+    if call.op >= .Desktop_Capture && call.op <= .Desktop_Input {
+        open_desktop(server, stream, call, body)
         return
     }
     if call.op < .Stat || call.op > .Watch {
@@ -401,6 +410,8 @@ pump_run :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bool {
 
 pump_call :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bool {
     #partial switch call.op {
+    case .Desktop_Capture, .Desktop_Stream, .Desktop_Input:
+        return pump_desktop(stream, call)
     case .Attach:
         return pump_job(stream, call, buffer)
     case .Jobs:
@@ -543,6 +554,11 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
     defer _ = eco_close(udp_fd)
     if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
     server := Server{udp = udp, own = own^, clients = clients, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
+    if path := os.get_env("ECO_ODIN_DESKTOP_SOCKET", context.temp_allocator); path != "" {
+        if !valid_local_path(path) { return error_exit("invalid or non-private desktop IPC endpoint") }
+        server.desktop_socket = strings.clone_to_cstring(path)
+    }
+    defer if server.desktop_socket != nil { delete(server.desktop_socket) }
     // Not freed: approval threads may still post answers into it until the process exits.
     server.pairing = new(Pairing)
     if server.pairing == nil { return error_exit("out of memory") }
@@ -597,6 +613,13 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
                 if progressed && stream != nil && ikcp_waitsnd(stream.kcp) < c.int(window_for(stream)) { timeout = 0 }
                 if stream == nil || stream.application == nil || count+2 > len(fds) { continue }
                 call := cast(^Server_Call)stream.application
+                if call.desktop != nil && call.file >= 0 {
+                    mask := desktop_poll_mask(call.desktop)
+                    if mask != 0 {
+                        fds[count], events[count] = call.file, mask
+                        count += 1
+                    }
+                }
                 if call.op == .Tcp || call.op == .Udp {
                     mask: c.int
                     if !call.output_end && ikcp_waitsnd(stream.kcp) < c.int(window_for(stream)) { mask |= POLL_READ }
@@ -613,6 +636,11 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
                     }
                 }
             }
+        }
+        // Flush reliable traffic before sending the next paced video burst.
+        if video := server.desktop_stream; video != nil {
+            desktop := cast(^Server_Call)video.application
+            if desktop.desktop.phase == .Send_Frame { pump_video_frame(video, desktop.desktop) }
         }
         _ = eco_poll(raw_data(fds[:]), raw_data(events[:]), c.int(count), timeout)
     }

@@ -107,16 +107,74 @@ server starts a transfer worker only after it verifies that confirmation. Libcry
 demand when available. `ECO_ODIN_BULK_CRYPTO=portable` selects the wire-compatible Odin AES
 implementation. Each bulk connection is bounded to 2²² records per direction.
 
-The remote target of a forward is a numeric IP and port as seen by the server. TCP forwards preserve
-half-close. UDP forwards have a 1,135-byte application datagram limit and a bounded queue per sender.
-For MCP over stdio, configure the client to launch `eco-odin run --stdin -- PROGRAM ARGS...`.
-For Streamable HTTP, keep an `eco-odin forward` open and point the MCP client at the local endpoint.
+The remote target of a forward is a numeric IP and port as seen by the server. TCP forwarding
+bridges two TCP connections over a KCP stream and preserves half-close. UDP forwarding preserves
+datagram boundaries over a KCP stream, with a 1,135-byte application datagram limit and a bounded
+queue per sender.
 
 `start --id HEX` accepts a 32-character idempotency key. A detached worker owns the process and
 spools stdout, stderr and the exit status to disk. `attach` works across server and client daemon
 restarts. A worker that exits without publishing a result leaves an indeterminate job and the server
 does not rerun it. Jobs require an explicit store, retain at most 64 MiB per output stream and remain
 on disk until the operator removes them. A machine reboot can terminate the workers themselves.
+
+## Adapters for agents and tools
+
+First-party tools use the ECO CLI or binary IPC for native operations. To try a third-party ACP
+agent or MCP server over stdio, configure its client to launch
+`eco-odin run --stdin -- PROGRAM ARGS...`. The two ends still speak their original protocol.
+For a third-party MCP server using Streamable HTTP, use `eco-odin forward` and point the MCP client
+at the local endpoint.
+
+## Desktop control
+
+The desktop host needs macOS 14 or later. Run the helper and the ECO server as the same logged-in
+user. After building ECO, build and start the helper from that user's graphical session.
+
+```sh
+./odin/build.sh desktop
+mkdir -p -m 700 "$HOME/.eco-desktop"
+bin/eco-desktop --request-permissions
+bin/eco-desktop "$HOME/.eco-desktop/helper.sock"
+```
+
+macOS controls Screen Recording and Accessibility. Enable both for the helper or its launching app
+as indicated by macOS, then relaunch the helper if prompted. Start the ECO server in its own shell.
+
+```sh
+ECO_ODIN_DESKTOP_SOCKET="$HOME/.eco-desktop/helper.sock" \
+  bin/eco-odin serve SERVER_IP:8443 server.key clients /path/to/repo run
+```
+
+After [pairing](#build-and-pair), use the normal client CLI on the controlling machine.
+
+```sh
+bin/eco-odin desktop capture > screen.jpg
+bin/eco-odin desktop click 150 80
+bin/eco-odin desktop type 'Hello'
+bin/eco-odin desktop stream 4 | ffplay -f mjpeg -i -
+```
+
+`move X Y` and `click X Y [left|right]` use pixels in the returned image, with origin at the
+top left. The helper captures the main display and scales the longest side to at most 960 pixels.
+`key CODE` presses and releases a macOS virtual key. `scroll DX DY` takes signed pixel deltas.
+Clicks and keys send paired down/up events. Use Mirai's API for scene operations and viewport
+capture.
+
+The daemon talks to the helper over an owner-only Unix socket using a 32-bit little-endian length
+followed by a binary request or response. Desktop calls require unconfined execution in the existing
+`run` mode. Snapshots and input travel on reliable ECO streams. The stream command yields
+concatenated JPEGs, defaults to 4 FPS, and accepts a capture rate from 1 to 10 FPS. One video stream
+may run per host and Ctrl-C cancels it. Video is paced at up to four datagrams per 10 ms after
+reliable traffic has been serviced.
+
+A video datagram is an authenticated ECO2 record in the existing Noise session. Its plaintext
+starts with the stream ID (`u32`), frame ID (`u32`), zero-based chunk index (`u16`) and chunk count
+(`u16`), all little-endian. Each chunk holds up to 1,148 bytes of a JPEG, for at most 1,200 bytes of
+UDP payload including ECO and Noise overhead. The JPEG is capped at 256 KiB. The receiver accepts
+out-of-order chunks within a frame, discards incomplete frames when a newer frame starts, and
+rejects fragments for frames older than one second from their first chunk. JPEGs are independent, so
+the next complete image can be displayed immediately after loss.
 
 ## Capability grants
 
@@ -207,13 +265,14 @@ detached job, and pairing through the approval dialog with denial, approval and 
 ./odin/build.sh test
 python3 -B odin/smoke.py
 python3 -B odin/extended_test.py
+python3 -B odin/desktop_test.py
 python3 -B odin/bench.py --bulk-mib 8
-python3 -B odin/compare.py --previous /path/to/old/eco
+python3 -B odin/compare.py
 ```
 
 The loopback tests cover binary files, verified atomic replacement, concurrent streams, terminal
 resize, stdin, both types of forwarding, signed scopes, replay and corruption handling, source-port
 migration, scoped builds on Linux, encrypted bulk transfers and job recovery after restarting
-both daemons. The comparison interleaves the old ECO and a local OpenSSH instance with
+both daemons. The comparison interleaves ECO and a local OpenSSH instance with
 temporary credentials. It reports CLI launch separately from warm requests and validates each
 download independently.

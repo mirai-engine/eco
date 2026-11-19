@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interleave ECO, previous ECO and OpenSSH loopback benchmarks with temporary credentials."""
+"""Interleave ECO and OpenSSH loopback benchmarks with temporary credentials."""
 from argparse import ArgumentParser
 from collections import defaultdict
 from contextlib import ExitStack
@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import random
-import re
 import shlex
 import socket
 import statistics
@@ -58,25 +57,6 @@ def start(stack, args, **options):
 
     stack.callback(stop)
     return process
-
-
-def previous_session(stack, binary, base):
-    server = start(stack, [binary, "serve", "--dir", base/"go-srv", "--addr", "127.0.0.1:0", "--pair"],
-                   stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    port = int(re.search(rb"127\.0\.0\.1:(\d+)", server.stderr.readline())[1])
-    flags = ["--dir", base/"go-client", "--addr", endpoint(port)]
-    pair = start(stack, [binary, "pair", *flags], stderr=subprocess.PIPE)
-    code = re.search(rb"\d{4}-\d{4}", pair.stderr.readline())[0]
-    while line := server.stderr.readline():
-        if b"code:" in line:
-            assert code in line
-            break
-    server.stdin.write(b"y\n")
-    server.stdin.flush()
-    if pair.wait(timeout=5) != 0:
-        raise RuntimeError("could not pair previous ECO instance")
-    pipe = start(stack, [binary, "connect", *flags], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    return server, pipe, flags
 
 
 def ssh_session(stack, base, control):
@@ -152,28 +132,24 @@ def local_request(conn, opcode, payload=b""):
 
 def main():
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--previous", type=Path, required=True, help="previous ECO executable")
     parser.add_argument("--samples", type=int, default=40)
     parser.add_argument("--size-mib", type=int, default=32)
     arguments = parser.parse_args()
-    previous = arguments.previous.resolve()
-    assert previous.is_file()
 
     with tempfile.TemporaryDirectory(prefix="eco-", dir="/tmp") as tmp, ExitStack() as stack:
         base = Path(tmp)
-        server_key = cli("keygen", base/"new-srv").stdout.decode().strip()
-        client_key = cli("keygen", base/"new-client").stdout.decode().strip()
-        (base/"new-clients").write_text(client_key + "\n")
-        local = base/"new.sock"
+        server_key = cli("keygen", base/"eco-server").stdout.decode().strip()
+        client_key = cli("keygen", base/"eco-client").stdout.decode().strip()
+        (base/"eco-clients").write_text(client_key + "\n")
+        local = base/"eco.sock"
         target = endpoint(port_for())
         env = {**os.environ, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_ADDR": target,
-               "ECO_ODIN_KEY": str(base/"new-client"), "ECO_ODIN_PEER": server_key}
+               "ECO_ODIN_KEY": str(base/"eco-client"), "ECO_ODIN_PEER": server_key}
         tcp_env = {**env, "ECO_ODIN_BULK_TCP": "1"}
-        server = stack.enter_context(background("serve", target, base/"new-srv", base/"new-clients", base, "run", env=tcp_env))
+        server = stack.enter_context(background("serve", target, base/"eco-server", base/"eco-clients", base, "run", env=tcp_env))
         assert b"listening" in server.stderr.readline()
-        client = stack.enter_context(background("client", local, target, base/"new-client", server_key, env=env))
+        client = stack.enter_context(background("client", local, target, base/"eco-client", server_key, env=env))
         wait_ready(local, client)
-        go_server, go_pipe, flags = previous_session(stack, previous, base)
         ssh_home = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="ssh-eco-", dir=Path.cwd().parent)))
         sshd, ssh_master, ssh_worker, ssh, scp_options, port = ssh_session(stack, ssh_home, base/"ctl")
         source = base/"fixture"
@@ -188,25 +164,6 @@ def main():
         send_message(session, 23)
         assert read_message(session) == bytes([39])
 
-        serial = 0
-
-        def old_request(method, executable=None, args=None):
-            nonlocal serial
-            serial += 1
-            request = {"id": str(serial), "method": method}
-            if executable:
-                request.update(executable=executable, args=args or [])
-            go_pipe.stdin.write(json.dumps(request) + "\n")
-            go_pipe.stdin.flush()
-            kind = "exit" if executable else "pong"
-            while line := go_pipe.stdout.readline():
-                event = json.loads(line)
-                assert event["id"] == str(serial) and event["type"] != "error", event
-                if event["type"] == kind:
-                    assert event.get("exit_code", 0) == 0 and not event.get("error"), event
-                    return
-            raise RuntimeError("previous ECO session closed")
-
         def ssh_request(command):
             ssh_worker.stdin.write(json.dumps(command) + "\n")
             ssh_worker.stdin.flush()
@@ -220,12 +177,9 @@ def main():
 
         cases = {
             "Odin ping / persistent IPC": lambda: local_request(session, 1),
-            "Go ping / persistent JSON": lambda: old_request("ping"),
             "Odin stat / persistent IPC": lambda: local_request(session, 2, b"fixture"),
-            "Go stat / remote program": lambda: old_request("exec", "/usr/bin/stat", stat_args),
             "SSH stat / persistent worker": lambda: ssh_request(["/usr/bin/stat", *stat_args]),
             "Odin true / warm daemon": native_run,
-            "Go true / persistent JSON": lambda: old_request("exec", "/usr/bin/true"),
             "SSH true / persistent worker": lambda: ssh_request(["/usr/bin/true"]),
             "SSH true / ControlMaster": lambda: cli_call([*ssh, "127.0.0.1", "/usr/bin/true"]),
             "Odin ping / fresh CLI": lambda: cli("ping", env=env),
@@ -233,7 +187,6 @@ def main():
         for action in cases.values():
             action()
         print(f"Warm idle RSS. Odin server/client {rss_group(server):.2f}/{rss_group(client):.2f} MiB, "
-              f"Go server/client {rss_group(go_server):.2f}/{rss_group(go_pipe):.2f} MiB, "
               f"OpenSSH server tree/client tree {rss_group(sshd, descend=True):.2f}/"
               f"{rss_group(ssh_master, ssh_worker, descend=True):.2f} MiB", flush=True)
         results = defaultdict(list)
@@ -249,7 +202,6 @@ def main():
         transfers = {
             "Odin UDP verified get": lambda: cli("get", "fixture", download, env=env, timeout=40),
             "Odin TCP verified get": lambda: cli("get", "fixture", download, env=tcp_env, timeout=40),
-            "Go TCP verified get": lambda: cli_call([previous, "get", *flags, source, download]),
             "OpenSSH SFTP / ControlMaster": lambda: cli_call(
                 ["scp", *scp_options, "-P", str(port), f"127.0.0.1:{source}", download]
             ),

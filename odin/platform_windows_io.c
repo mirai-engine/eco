@@ -576,6 +576,12 @@ int eco_connect_local(const char *name) {
     return fd;
 }
 
+int eco_try_connect_local(const char *name) {
+    int fd = eco_connect_local(name);
+    if (fd >= 0) eco_descriptor(fd)->nonblocking = TRUE;
+    return fd;
+}
+
 int eco_accept_local(int listener) {
     EcoDescriptor *entry = eco_descriptor(listener);
     if (!entry || entry->type != EC_LISTENER) return -1;

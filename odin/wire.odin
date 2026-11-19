@@ -26,6 +26,7 @@ foreign platform {
     eco_poll :: proc(fds, events: [^]c.int, count, timeout: c.int) -> c.int ---
     eco_listen_local :: proc(name: cstring) -> c.int ---
     eco_connect_local :: proc(name: cstring) -> c.int ---
+    eco_try_connect_local :: proc(name: cstring) -> c.int ---
     eco_accept_local :: proc(listener: c.int) -> c.int ---
     eco_read :: proc(fd: c.int, buf: rawptr, count: c.int) -> c.int ---
     eco_write :: proc(fd: c.int, buf: rawptr, count: c.int) -> c.int ---
@@ -91,7 +92,7 @@ POLL_CLOSED :: 8 | 16 | 32
 
 Packet_Kind :: enum u8 {
     Hello = 1, Welcome, Data, Path_Challenge, Path_Response, Confirm, Keepalive, Close, Query, Query_Result,
-    Pair, Pair_Reply,
+    Pair, Pair_Reply, Desktop_Frame,
 }
 
 Record :: struct {
@@ -173,7 +174,7 @@ parse_header :: proc(data: []byte) -> (Record, bool) {
     }
     kind := Packet_Kind(data[4])
     id, nonce := get_u64(data[8:]), get_u64(data[16:])
-    if kind < .Hello || kind > .Pair_Reply || id == 0 {
+    if kind < .Hello || kind > .Desktop_Frame || id == 0 {
         return {}, false
     }
     return {kind, id, nonce}, true
@@ -464,6 +465,7 @@ receive_record :: proc(link: ^Link, header: Record, from: net.Endpoint, packet, 
         return nil
     }
     if header.kind == (.Query if accept_new else .Query_Result) { return plain }
+    if !accept_new && header.kind == .Desktop_Frame { return plain }
     if header.kind != .Data || !valid_segments(plain) { return nil }
     id := get_u32(plain)
     stream := find_stream(link, id)

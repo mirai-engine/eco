@@ -31,6 +31,8 @@ USAGE :: `usage: eco-odin COMMAND
   run [--stdin] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
   start [--id HEX] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
   attach ID [STDOUT_OFFSET STDERR_OFFSET] | jobs | kill ID
+  desktop capture | stream [FPS]     write a JPEG or a stream of JPEGs
+  desktop click X Y [left|right] | move X Y | type TEXT | key CODE | scroll DX DY
   forward|forward-udp LISTEN TARGET
   tty [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
 
@@ -264,8 +266,13 @@ command_cli :: proc(args: []string) -> int {
     payload: []byte
     run_data: [MESSAGE_MAX-1]byte
     term_rows, term_cols: u16
+    desktop_data: [MESSAGE_MAX-1]byte
     job_data: [MESSAGE_MAX-1]byte
     switch command {
+    case "desktop":
+        valid: bool
+        op, payload, valid = desktop_request(args[1:], desktop_data[:])
+        if !valid { return error_exit(USAGE) }
     case "ping":
         if len(args) != 1 { return error_exit(USAGE) }
         op = .Ping

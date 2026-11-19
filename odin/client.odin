@@ -24,6 +24,7 @@ foreign platform {
 Local_Call :: struct {
     fd: c.int,
     stream: ^Stream,
+    video: ^Video_Receiver,
     input, output: [MESSAGE_MAX+2]byte,
     used, out_len, out_pos: int,
     complete, disconnecting, batch: bool,
@@ -104,6 +105,7 @@ close_local :: proc(bridge: ^Bridge, slot: ^^Local_Call) {
             }
         }
     }
+    if call.video != nil { free(call.video) }
     free(call)
     slot^ = nil
 }
@@ -207,7 +209,8 @@ forward_local :: proc(bridge: ^Bridge, call: ^Local_Call) -> bool {
                     local_failure(call, "no remote stream available")
                     return true
                 }
-                call.stream.bulk = op == .Read || op == .Write
+                call.stream.bulk = op == .Read || op == .Write || op == .Desktop_Capture
+                if op == .Desktop_Stream { call.video = new(Video_Receiver) }
             }
             if !send_message(call.stream, message[0], message[1:]) {
                 local_failure(call, "cannot queue request")
@@ -228,7 +231,14 @@ forward_local :: proc(bridge: ^Bridge, call: ^Local_Call) -> bool {
     }
     if call.out_pos == call.out_len {
         packet: [MESSAGE_MAX]byte
-        message := read_message(call.stream, packet[:])
+        message: []byte
+        if !call.disconnecting && call.video != nil && call.video.output_offset > 0 {
+            message = read_video_output(call.video, packet[:])
+        }
+        if message == nil { message = read_message(call.stream, packet[:]) }
+        if message == nil && !call.disconnecting && call.video != nil {
+            message = read_video_output(call.video, packet[:])
+        }
         if message != nil {
             op := Op(message[0])
             call.complete = op == .Done || op == .Failure
@@ -284,7 +294,11 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
             header, ok := parse_header(packet[:n])
             if ok && header.id == bridge.link.id {
                 if result := receive_record(bridge.link, header, from, packet[:n], scratch[:], false); result != nil {
-                    receive_query_result(&bridge, result)
+                    if header.kind == .Desktop_Frame {
+                        receive_desktop_frame(&bridge, result)
+                    } else {
+                        receive_query_result(&bridge, result)
+                    }
                 }
             }
         }
