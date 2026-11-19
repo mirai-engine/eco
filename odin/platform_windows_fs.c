@@ -96,7 +96,8 @@ static HANDLE open_relative(HANDLE dir, const char *name, ACCESS_MASK access, UL
     if (directory == 1) options |= FILE_DIRECTORY_FILE;
     if (directory == 0) options |= FILE_NON_DIRECTORY_FILE;
     NtCreateFileFn create = nt_create();
-    NTSTATUS status = create ? create(&value, access | SYNCHRONIZE, &object, &io, NULL,
+    // valid_handle reads the attributes, so every handle needs FILE_READ_ATTRIBUTES.
+    NTSTATUS status = create ? create(&value, access | SYNCHRONIZE | FILE_READ_ATTRIBUTES, &object, &io, NULL,
                                       FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                       disposition, options, NULL, 0) : -1;
     free(wide);

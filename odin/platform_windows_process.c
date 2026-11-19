@@ -126,6 +126,9 @@ static HANDLE create_process(char *const args[], const wchar_t *directory, HANDL
     if (ok && terminal) {
         ok = UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                        terminal, sizeof(terminal), NULL, NULL);
+        // Null standard handles make the child attach to the pseudoconsole instead of copying
+        // this process's redirected handle values, which it does not inherit.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     } else if (ok) {
         for (int i = 0; i < 3 && ok; ++i) {
             ok = SetHandleInformation(handles[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);

@@ -4,6 +4,8 @@ param([switch]$Test)
 
 $ErrorActionPreference = 'Stop'
 function Invoke-Checked([string] $Program, [string[]] $Arguments) {
+    # The exit code decides; Windows PowerShell turns redirected stderr lines into errors.
+    $ErrorActionPreference = 'Continue'
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Program exited with $LASTEXITCODE" }
 }
@@ -13,8 +15,8 @@ function Get-Dependency([string] $Name, [string] $Url, [string] $Revision) {
     if (!(Test-Path "$Directory/.git")) {
         Invoke-Checked git @('init', '-q', $Directory)
     }
-    & git -C $Directory cat-file -e "$Revision`^{commit}" 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $Present = & git -C $Directory rev-parse -q --verify "$Revision`^{commit}"
+    if (!$Present) {
         Invoke-Checked git @('-C', $Directory, 'fetch', '-q', '--depth', '1', $Url, $Revision)
     }
     Invoke-Checked git @('-C', $Directory, 'checkout', '-q', '--detach', $Revision)
@@ -25,7 +27,7 @@ try {
     if ($env:VSCMD_ARG_TGT_ARCH -and $env:VSCMD_ARG_TGT_ARCH -ne 'x64') {
         throw 'Run this build in an x64 Visual Studio developer shell.'
     }
-    $null = New-Item -ItemType Directory -Force -Path '.eco-deps', '.eco-depswindows_amd64', 'bin'
+    $null = New-Item -ItemType Directory -Force -Path '.eco-deps', '.eco-deps/windows_amd64', 'bin'
     Get-Dependency blake3 'https://github.com/mirai-engine/odin-blake3.git' 'd937acf940a85fa26b2ec207df51b9bda04f6c20'
     Get-Dependency kcp 'https://github.com/skywind3000/kcp.git' 'b1a7a2101dcbb96017681a500d6b82bbe5a88766'
     $Objects = @()

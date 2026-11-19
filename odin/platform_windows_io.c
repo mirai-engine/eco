@@ -322,7 +322,17 @@ int eco_fd_setup(int fd, int nonblock) {
     entry->nonblocking = nonblock != 0;
     if (entry->type == EC_SOCKET) {
         u_long enabled = nonblock != 0;
-        return ioctlsocket(entry->socket, FIONBIO, &enabled) == 0 ? 0 : -1;
+        if (ioctlsocket(entry->socket, FIONBIO, &enabled) != 0) return -1;
+        // Windows reports an ICMP port unreachable as a reset on the next receive of a UDP
+        // socket; a peer that went away must not interrupt the datagrams of the others.
+        int type = 0, size = sizeof(type);
+        if (getsockopt(entry->socket, SOL_SOCKET, SO_TYPE, (char *)&type, &size) != 0) return -1;
+        if (type == SOCK_DGRAM) {
+            BOOL report = FALSE;
+            DWORD returned = 0;
+            if (WSAIoctl(entry->socket, SIO_UDP_CONNRESET, &report, sizeof(report), NULL, 0,
+                         &returned, NULL, NULL) != 0) return -1;
+        }
     }
     return 0;
 }
