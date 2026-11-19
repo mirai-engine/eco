@@ -26,21 +26,33 @@ bin/eco-odin keygen server.key  # run on the server machine
 bin/eco-odin keygen client.key  # run on the client machine
 ```
 
-Exchange the printed public keys over an authenticated channel. Leave the private files on their
-respective machines. The server pins one client public key per listener.
+Leave the private files on their respective machines. The server accepts the clients listed in a
+`CLIENTS` file, one public key per line followed by an optional label; it reads the file on every
+handshake, so deleting a line revokes that client for its next session. Pairing fills both sides
+without copying keys:
 
 ```sh
 # Server, with native read/write, command execution, PTY and forwarding enabled
 mkdir -m 700 "$HOME/.eco-odin-jobs"
 ECO_ODIN_JOBS="$HOME/.eco-odin-jobs" \
-  bin/eco-odin serve 192.0.2.10:8443 server.key CLIENT_PUBLIC /path/to/repo run
+  bin/eco-odin serve 192.0.2.10:8443 server.key clients /path/to/repo run --pair
 
 # Client
 export ECO_ODIN_ADDR=192.0.2.10:8443
 export ECO_ODIN_KEY="$PWD/client.key"
-export ECO_ODIN_PEER=SERVER_PUBLIC
+bin/eco-odin pair "$ECO_ODIN_ADDR" laptop
 bin/eco-odin ping
 ```
+
+Both screens show the same verification code, for example `0346-9283`. It is derived from the
+transcript of a `Noise_XX` handshake, which binds both static keys, so a machine in the middle
+makes the two codes differ. Compare them and answer `y` or `n` in the server's terminal; the
+request waits five minutes. On approval the server appends the client to `CLIENTS` and the client
+stores the server key under its address in `ECO_ODIN_HOME/known_servers` (`~/.eco-odin` by
+default), which later commands use for that `ECO_ODIN_ADDR`; `ECO_ODIN_PEER` pins a key instead.
+The server handles one request at a time and refuses pairing after five denied or expired
+requests until it restarts. The code has 8 digits; answer only a request you expect. Restart the
+server without `--pair` once every machine is paired.
 
 The client starts its daemon on demand and exits it after two minutes without local calls.
 Alternatively, run `eco-odin client SOCKET UDP KEY PEER` in the foreground. Use a separate
@@ -171,8 +183,8 @@ Cross-compile on macOS or Linux with a matching LLVM-MinGW UCRT toolchain.
 
 Both builds produce `bin/eco-windows-amd64.exe`. On Windows, the default IPC endpoint is
 `\\.\pipe\eco-odin-<current-user-SID>`. For a second daemon, set `ECO_ODIN_SOCKET` to a
-different local pipe name, such as `\\.\pipe\eco-odin-work`. Set `ECO_ODIN_ADDR`,
-`ECO_ODIN_KEY`, and `ECO_ODIN_PEER` as on Unix. Key generation creates a private ACL.
+different local pipe name, such as `\\.\pipe\eco-odin-work`. Set `ECO_ODIN_ADDR` and
+`ECO_ODIN_KEY`, and pair, as on Unix. Key generation creates a private ACL.
 The job directory must be on NTFS and owned by the launching user with an ACL scoped to
 that user and trusted system administrators.
 
@@ -181,10 +193,9 @@ that user and trusted system administrators.
 .\bin\eco-windows-amd64.exe tty -- powershell.exe -NoLogo
 ```
 
-Verification for this branch covers Windows x64 cross-compilation and PE imports. The
-Windows smoke suite is intended for a native host, where it exercises identity, IOCP
-IPC, binary I/O, ConPTY resize, reparse-point rejection, files over UDP and TCP, and
-reattaching to a detached job.
+The Windows smoke suite runs on a native host. It exercises identity, IOCP IPC, binary I/O,
+ConPTY resize, reparse-point rejection, files over UDP and TCP, forwarding, reattaching to a
+detached job, and pairing with denial, approval and revocation.
 
 ## Verify and measure
 

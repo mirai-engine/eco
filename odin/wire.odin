@@ -91,6 +91,7 @@ POLL_CLOSED :: 8 | 16 | 32
 
 Packet_Kind :: enum u8 {
     Hello = 1, Welcome, Data, Path_Challenge, Path_Response, Confirm, Keepalive, Close, Query, Query_Result,
+    Pair, Pair_Reply,
 }
 
 Record :: struct {
@@ -116,7 +117,7 @@ Link :: struct {
     grant_expiry: u64,
     rights: u8,
     confined: bool,
-    scope_key: [32]byte,
+    scope_key, client_key: [32]byte,
     path: net.Endpoint,
     challenge: [16]byte,
     challenge_at: time.Tick,
@@ -172,7 +173,7 @@ parse_header :: proc(data: []byte) -> (Record, bool) {
     }
     kind := Packet_Kind(data[4])
     id, nonce := get_u64(data[8:]), get_u64(data[16:])
-    if kind < .Hello || kind > .Query_Result || id == 0 {
+    if kind < .Hello || kind > .Pair_Reply || id == 0 {
         return {}, false
     }
     return {kind, id, nonce}, true
@@ -332,7 +333,7 @@ connect_link :: proc(udp: net.UDP_Socket, endpoint: net.Endpoint, own: ^ecdh.Pri
 }
 
 accept_link :: proc(udp: net.UDP_Socket, from: net.Endpoint, packet: []byte, header: Record,
-                    own: ^ecdh.Private_Key, peer: ^ecdh.Public_Key, root: c.int,
+                    own: ^ecdh.Private_Key, clients: string, root: c.int,
                     policy: ^Policy) -> ^Link {
     if header.nonce != 0 || len(packet) < HELLO_MIN || len(packet) > HELLO_MAX { return nil }
     handshake: noise.Handshake_State
@@ -341,7 +342,7 @@ accept_link :: proc(udp: net.UDP_Socket, from: net.Endpoint, packet: []byte, hea
     decoded: [1+CAP_MAX]byte
     early, status := noise.handshake_read_message(&handshake, packet[HEADER_SIZE:], decoded[:])
     if status != .Handshake_Pending || len(early) == 0 || early[0] > 1 ||
-       !ecdh.public_key_equal(&handshake.rs, peer) {
+       !client_authorized(clients, &handshake.rs) {
         return nil
     }
     grant, permitted := verify_capability(policy, &handshake.rs, early[1:])
@@ -353,6 +354,7 @@ accept_link :: proc(udp: net.UDP_Socket, from: net.Endpoint, packet: []byte, hea
     link.confined = grant.scope != "." && grant.mask & CAP_RUN != 0
     if link.confined { link.scope_key = scope_key(grant.scope) }
     link.id, link.udp, link.remote = header.id, udp, from
+    ecdh.public_key_bytes(&handshake.rs, link.client_key[:])
     link.hello_len = copy(link.client_hello[:], packet)
     write_header(link.server_hello[:], .Welcome, header.id, 0)
     reply, result := noise.handshake_write_message(&handshake, early[:1], link.server_hello[HEADER_SIZE:])

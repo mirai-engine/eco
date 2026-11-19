@@ -163,12 +163,13 @@ def main():
         base = Path(tmp)
         server_key = cli("keygen", base/"new-srv").stdout.decode().strip()
         client_key = cli("keygen", base/"new-client").stdout.decode().strip()
+        (base/"new-clients").write_text(client_key + "\n")
         local = base/"new.sock"
         target = endpoint(port_for())
         env = {**os.environ, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_ADDR": target,
                "ECO_ODIN_KEY": str(base/"new-client"), "ECO_ODIN_PEER": server_key}
         tcp_env = {**env, "ECO_ODIN_BULK_TCP": "1"}
-        server = stack.enter_context(background("serve", target, base/"new-srv", client_key, base, "run", env=tcp_env))
+        server = stack.enter_context(background("serve", target, base/"new-srv", base/"new-clients", base, "run", env=tcp_env))
         assert b"listening" in server.stderr.readline()
         client = stack.enter_context(background("client", local, target, base/"new-client", server_key, env=env))
         wait_ready(local, client)

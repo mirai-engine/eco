@@ -51,10 +51,12 @@ def main():
         server_secret, client_secret = base / "server", base / "client"
         server_key = cli("keygen", server_secret).stdout.decode().strip()
         client_key = cli("keygen", client_secret).stdout.decode().strip()
+        clients = base / "clients"
+        clients.write_text(client_key + "\n")
         target = endpoint(port_for())
         path = base / "s"
         env = {**os.environ, "ECO_ODIN_SOCKET": str(path)}
-        with background("serve", target, server_secret, client_key, base, "run") as server:
+        with background("serve", target, server_secret, clients, base, "run") as server:
             assert b"listening" in server.stderr.readline()
             time.sleep(0.2)
             print(f"server idle, no client       RSS {rss(server)[server.pid]:.2f} MiB", flush=True)

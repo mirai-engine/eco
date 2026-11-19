@@ -8,11 +8,13 @@ from ctypes import wintypes
 import msvcrt
 import os
 from pathlib import Path
+import queue
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -137,13 +139,16 @@ def check_tunnels(background, base, env):
                     data, origin = service.recvfrom(1024)
                     service.sendto(data, origin)
                 else:
-                    conn, _ = service.accept()
-                    with conn:
-                        conn.settimeout(5)
-                        data = bytearray()
-                        for block in iter(lambda: conn.recv(1024), b""):
-                            data += block
-                        conn.sendall(data)
+                    # A probe that timed out before the relay listened can still connect when
+                    # Windows retries its SYN; the relay forwards it empty, so skip it.
+                    data = bytearray()
+                    while not data:
+                        conn, _ = service.accept()
+                        with conn:
+                            conn.settimeout(5)
+                            for block in iter(lambda: conn.recv(1024), b""):
+                                data += block
+                            conn.sendall(data)
 
             expected = pool.submit(echo)
             with socket.socket(socket.AF_INET, kind) as reserve:
@@ -171,11 +176,73 @@ def check_tunnels(background, base, env):
                                 output = b"".join(iter(lambda: probe.recv(1024), b""))
                             assert output == payload
                             break
-                        except (TimeoutError, ConnectionRefusedError):
+                        # Windows reports a datagram sent before the relay listens as a reset.
+                        except (TimeoutError, ConnectionRefusedError, ConnectionResetError):
                             if time.monotonic() >= deadline:
                                 raise
                             time.sleep(0.02)
                 expected.result(timeout=2)
+
+
+def check_pairing(binary, base, run, root):
+    home, server_key, client_key = base / "pair-home", base / "pair-server.key", base / "pair-client.key"
+    home.mkdir()
+    server_public = run("keygen", server_key).stdout.decode().strip()
+    client_public = run("keygen", client_key).stdout.decode().strip()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        address = f"127.0.0.1:{reserve.getsockname()[1]}"
+    clients = base / "pair-clients"
+    env = {**os.environ, "ECO_ODIN_HOME": str(home), "ECO_ODIN_KEY": str(client_key),
+           "ECO_ODIN_ADDR": address, "ECO_ODIN_SOCKET": r"\\.\pipe\eco-win-pair-" + uuid.uuid4().hex}
+    for name in ("ECO_ODIN_PEER", "ECO_ODIN_CAPABILITY", "ECO_ODIN_BULK_TCP"):
+        env.pop(name, None)
+    server = subprocess.Popen([binary, "serve", address, server_key, clients, root, "read", "--pair"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    lines = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(line) for line in server.stdout], daemon=True).start()
+
+    def server_line(text):
+        deadline = time.monotonic() + 10
+        while True:
+            line = lines.get(timeout=max(deadline - time.monotonic(), 0.01)).decode()
+            if text in line:
+                return line
+
+    def request(answers):
+        client = subprocess.Popen([binary, "pair", address, "laptop"], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        prompt = server_line("pairing request from laptop")
+        shown = client.stdout.readline().decode()
+        code = prompt.split("code ")[1].split(".")[0]
+        assert shown.startswith(f"verification code {code};"), (prompt, shown)
+        for answer, reply in answers:
+            server.stdin.write(answer)
+            server.stdin.flush()
+            if reply:
+                server_line(reply)
+        output, error = client.communicate(timeout=10)
+        return client.returncode, output, error
+
+    try:
+        server_line("listening")
+        assert run("ping", env=env, checked=False).returncode != 0  # Unknown server.
+        status, _, error = request([(b"n\n", None)])
+        assert status != 0 and b"denied" in error, error
+        assert not clients.exists()
+        status, output, error = request([(b"maybe\n", "answer y or n"), (b"y\n", None)])
+        assert status == 0, error
+        assert server_public.encode() in output, output
+        assert clients.read_text().split()[0] == client_public
+        assert (home / "known_servers").read_text().split() == [address, server_public]
+        assert run("ping", env=env).stdout.startswith(b"pong")
+        assert run("stat", ".", env=env).stdout.startswith(b"directory")
+        stop_test_daemon(env["ECO_ODIN_SOCKET"])
+        clients.write_text("")  # Revocation applies to the next handshake.
+        assert run("ping-early", address, client_key, server_public, env=env, checked=False).returncode != 0
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
 
 
 def main():
@@ -236,7 +303,9 @@ def main():
         env.pop("ECO_ODIN_CAPABILITY", None)
         env.pop("ECO_ODIN_BULK_TCP", None)
         bulk = {**env, "ECO_ODIN_BULK_TCP": "1"}
-        server_args = ("serve", address, server_key, client_public, root, "run")
+        clients = base / "clients"
+        clients.write_text(client_public + " smoke\n")
+        server_args = ("serve", address, server_key, clients, root, "run")
         client_args = ("client", pipe, address, client_key, server_public)
         with background(*server_args, directory=base, env=bulk):
             with background(*client_args, directory=base, env=env) as client:
@@ -296,6 +365,8 @@ def main():
         with background(*server_args, directory=base, env=bulk):
             assert run("ping", env=auto_env).stdout.startswith(b"pong")
             stop_test_daemon(auto_env["ECO_ODIN_SOCKET"])
+
+        check_pairing(binary, base, run, root)
 
     print("Windows native ECO smoke passed")
 

@@ -69,6 +69,8 @@ def main():
         server_secret, client_secret = keys / "server", keys / "client"
         server_key = cli("keygen", server_secret).stdout.decode().strip()
         client_key = cli("keygen", client_secret).stdout.decode().strip()
+        clients = keys / "clients"
+        clients.write_text(client_key + "\n")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
             reserve.bind(("127.0.0.1", 0))
             port = reserve.getsockname()[1]
@@ -76,7 +78,7 @@ def main():
         local_socket = base / "s"
         env = {**os.environ, "ECO_ODIN_SOCKET": str(local_socket)}
 
-        with background("serve", address, server_secret, client_key, root, "run") as server:
+        with background("serve", address, server_secret, clients, root, "run") as server:
             assert server.stderr.readline().startswith(b"eco-odin listening")
             assert cli("ping-early", address, client_secret, server_key).stdout.startswith(b"pong")
             stranger = keys / "stranger"

@@ -20,7 +20,10 @@ Access :: enum { Read, Write, Run, Tunnel }
 Server :: struct {
     udp: net.UDP_Socket,
     own: ecdh.Private_Key,
-    peer: ecdh.Public_Key,
+    // File of authorized client keys, read on every handshake so a removed line revokes at once.
+    clients: string,
+    // Present only while the server accepts pairing requests.
+    pairing: ^Pairing,
     access: Access,
     policy: Policy,
     root: c.int,
@@ -491,6 +494,10 @@ process_stream :: proc(server: ^Server, slot: ^^Stream) -> bool {
 receive_server :: proc(server: ^Server, packet, scratch: []byte, from: net.Endpoint) {
     header, ok := parse_header(packet)
     if !ok { return }
+    if header.kind == .Pair {
+        if server.pairing != nil { receive_pair(server, packet, header, from) }
+        return
+    }
     for link in server.links {
         if link == nil || link.id != header.id { continue }
         if header.kind == .Hello {
@@ -518,13 +525,13 @@ receive_server :: proc(server: ^Server, packet, scratch: []byte, from: net.Endpo
     for &slot in server.links {
         if slot != nil { continue }
         server.handshakes += 1
-        slot = accept_link(server.udp, from, packet, header, &server.own, &server.peer, server.root, &server.policy)
+        slot = accept_link(server.udp, from, packet, header, &server.own, server.clients, server.root, &server.policy)
         return
     }
 }
 
-serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public_Key,
-              root: string, access: Access, policy: Policy, jobs: string) -> int {
+serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
+              root: string, access: Access, policy: Policy, jobs: string, pair: bool) -> int {
     root_c := strings.clone_to_cstring(root)
     defer delete(root_c)
     fd := eco_root(root_c)
@@ -536,7 +543,15 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public
     if udp_fd < 0 { net.close(udp); return error_exit("cannot register UDP socket") }
     defer _ = eco_close(udp_fd)
     if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
-    server := Server{udp = udp, own = own^, peer = peer^, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
+    server := Server{udp = udp, own = own^, clients = clients, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
+    if pair {
+        server.pairing = new(Pairing)
+        if server.pairing == nil || !start_pair_console(server.pairing) {
+            return error_exit("cannot read pairing answers from the console")
+        }
+    }
+    // Not freed: the console thread keeps writing answers into it until the process exits.
+    defer if server.pairing != nil { reset_pairing(server.pairing) }
     bulk: Bulk_Server
     if bulk_enabled() && !enable_bulk(endpoint, &bulk) { return error_exit("cannot listen for bulk TCP") }
     defer clear_bulk(&bulk)
@@ -559,6 +574,10 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, peer: ^ecdh.Public
             receive_server(&server, buffer[:n], scratch[:], from)
         }
         timeout: c.int = 1000
+        if server.pairing != nil && server.pairing.active {
+            tick_pair(&server)
+            timeout = 100
+        }
         fds, events: [66]c.int
         fds[0], events[0] = udp_fd, POLL_READ
         fds[1], events[1] = children, POLL_READ

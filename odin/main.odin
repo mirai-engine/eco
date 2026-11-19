@@ -15,7 +15,9 @@ import "deps:blake3"
 
 USAGE :: `usage: eco-odin COMMAND
   keygen KEY                         create a 0600 X25519 key and print its public key
-  serve UDP KEY PEER ROOT [read|write|run|tunnel] [ISSUER_PUBLIC_KEY]
+  serve UDP KEY CLIENTS ROOT [read|write|run|tunnel] [ISSUER_PUBLIC_KEY] [--pair]
+                                     CLIENTS lists authorized client keys; --pair adds clients
+  pair UDP [NAME]                    trust a server started with --pair, using ECO_ODIN_KEY
   issuer-keygen KEY
   grant ISSUER_KEY SERVER_KEY CLIENT_KEY RWXT TTL_SECONDS PATH
   client SOCKET UDP KEY PEER         keep a client daemon in the foreground
@@ -32,7 +34,8 @@ USAGE :: `usage: eco-odin COMMAND
   forward|forward-udp LISTEN TARGET
   tty [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
 
-Client environment: ECO_ODIN_SOCKET, ECO_ODIN_ADDR, ECO_ODIN_KEY, ECO_ODIN_PEER.
+Client environment: ECO_ODIN_SOCKET, ECO_ODIN_ADDR, ECO_ODIN_KEY, ECO_ODIN_HOME and, unless pair
+stored the server for ECO_ODIN_ADDR in ECO_ODIN_HOME/known_servers, ECO_ODIN_PEER.
 Paths sent to the server are relative to ROOT. Peer keys are 64 hex characters.
 `
 
@@ -58,15 +61,22 @@ keygen :: proc(path: string) -> int {
     return 0
 }
 
-load_keys :: proc(path, peer_text: string, key: ^ecdh.Private_Key, peer: ^ecdh.Public_Key) -> bool {
+load_private :: proc(path: string, key: ^ecdh.Private_Key) -> bool {
     bytes: [32]byte
     defer crypto.zero_explicit(&bytes, len(bytes))
-    if !read_private_seed(path, bytes[:]) || !ecdh.private_key_set_bytes(key, .X25519, bytes[:]) { return false }
-    decoded, ok := hex.decode_into_buffer(transmute([]byte)peer_text, bytes[:])
-    return ok && len(decoded) == len(bytes) && ecdh.public_key_set_bytes(peer, .X25519, bytes[:])
+    return read_private_seed(path, bytes[:]) && ecdh.private_key_set_bytes(key, .X25519, bytes[:])
 }
 
-dispatch_platform :: proc(args: []string) -> int {
+load_keys :: proc(path, peer_text: string, key: ^ecdh.Private_Key, peer: ^ecdh.Public_Key) -> bool {
+    bytes: [32]byte
+    return load_private(path, key) && decode_key(peer_text, bytes[:]) &&
+           ecdh.public_key_set_bytes(peer, .X25519, bytes[:])
+}
+
+dispatch_platform :: proc(arguments: []string) -> int {
+    args := arguments
+    pair := args[0] == "serve" && args[len(args)-1] == "--pair"
+    if pair { args = args[:len(args)-1] }
     role := args[0]
     count := 4 if role == "ping-early" else 5
     if len(args) < count || len(args) > count+2 || (role != "serve" && len(args) != count) {
@@ -78,7 +88,9 @@ dispatch_platform :: proc(args: []string) -> int {
     own: ecdh.Private_Key
     defer ecdh.private_key_clear(&own)
     peer: ecdh.Public_Key
-    if !load_keys(args[2+shift], args[3+shift], &own, &peer) {
+    if role == "serve" {
+        if !load_private(args[2], &own) { return error_exit("invalid identity. It must be a private regular file") }
+    } else if !load_keys(args[2+shift], args[3+shift], &own, &peer) {
         return error_exit("invalid identity or peer. Identity must be a private regular file")
     }
     token: []byte
@@ -119,7 +131,7 @@ dispatch_platform :: proc(args: []string) -> int {
                 return error_exit("ECO_ODIN_JOBS must be an absolute, private directory owned by you")
             }
         }
-        return serve(endpoint, &own, &peer, args[4], access, policy, jobs)
+        return serve(endpoint, &own, args[3], args[4], access, policy, jobs, pair)
     case "client":
         return client_daemon(args[1], endpoint, &own, &peer, token)
     case "ping-early":
@@ -148,11 +160,9 @@ dial_local :: proc() -> c.int {
         if path == "" { path = default_pipe_name() }
     }
     if path == "" {
-        directory, err := os.user_home_dir(context.temp_allocator)
-        if err != nil { return -1 }
-        private_dir := fmt.tprintf("%s/.eco-odin", directory)
-        _ = os.mkdir(private_dir, {.Read_User, .Write_User, .Execute_User})
-        path = fmt.tprintf("%s/socket", private_dir)
+        home := eco_home()
+        if home == "" { return -1 }
+        path = fmt.tprintf("%s/socket", home)
     }
     if !valid_local_path(path) { return -1 }
     name := strings.clone_to_cstring(path, context.temp_allocator)
@@ -161,7 +171,7 @@ dial_local :: proc() -> c.int {
 
     address := os.get_env("ECO_ODIN_ADDR", context.temp_allocator)
     key := os.get_env("ECO_ODIN_KEY", context.temp_allocator)
-    peer := os.get_env("ECO_ODIN_PEER", context.temp_allocator)
+    peer := client_peer(address)
     if address == "" || key == "" || peer == "" { return -1 }
     executable, err := os.get_executable_path(context.temp_allocator)
     if err != nil { return -1 }
@@ -325,7 +335,7 @@ command_cli :: proc(args: []string) -> int {
         payload = transmute([]byte)path
     }
     fd := dial_local()
-    if fd < 0 { return error_exit("client unavailable; configure ECO_ODIN_ADDR, ECO_ODIN_KEY and ECO_ODIN_PEER") }
+    if fd < 0 { return error_exit("client unavailable; set ECO_ODIN_ADDR and ECO_ODIN_KEY, and pair with the server or set ECO_ODIN_PEER") }
     defer close_fd(&fd)
 
     input := os.stdin
@@ -441,6 +451,10 @@ main :: proc() {
         os.exit(forward(bind, args[2], args[0] == "forward-udp"))
     case "serve", "client", "ping-early":
         os.exit(dispatch_platform(args))
+    case "pair":
+        if len(args) != 2 && len(args) != 3 { os.exit(error_exit(USAGE)) }
+        name := args[2] if len(args) == 3 else os.get_env("COMPUTERNAME" when ODIN_OS == .Windows else "HOSTNAME", context.temp_allocator)
+        os.exit(pair_client(args[1], name))
     case:
         os.exit(command_cli(args))
     }

@@ -1,7 +1,6 @@
 package eco
 
 import "core:c"
-import "core:crypto/ecdh"
 import "core:encoding/hex"
 import "core:fmt"
 import "core:os"
@@ -32,9 +31,7 @@ scope_key :: proc(path: string) -> [32]byte {
 }
 
 ensure_job_namespace :: proc(server: ^Server, link: ^Link) -> string {
-    peer: [32]byte
-    ecdh.public_key_bytes(&server.peer, peer[:])
-    name := hex.encode(peer[:])
+    name := hex.encode(link.client_key[:])
     defer delete(name)
     directory: string
     if link.confined {
