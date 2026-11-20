@@ -93,6 +93,12 @@ eco-odin attach "$job" 128 0  # resume at these stdout and stderr byte offsets
 eco-odin kill "$job"
 ```
 
+`run`, `tty` and `start` accept command arguments and a working directory totaling up to
+128 KiB of encoded request data. The remote operating system can impose a smaller limit.
+Use `run --stdin` for script input or other streamed data. A command's timeout includes draining
+its output. Windows exit codes above 255 are printed in hexadecimal. On macOS and Linux
+the CLI returns 125 for those codes because the local process status has only eight bits.
+
 File paths are relative to the server root or the granted subdirectory. Native operations walk
 directory descriptors and reject symlink traversal. Uploads are verified before atomic replacement.
 Downloads verify their whole BLAKE3 digest before replacing the local destination. `watch` samples
@@ -215,9 +221,11 @@ respect the grant expiry. The job namespace binds to the client identity and gra
   are per stream. A shared byte budget paces large UDP file records across streams. Set
   `ECO_ODIN_BULK_MBPS` on each sending daemon to match the available rate in megabits per second.
   The default budget is 10,000 Mbps. Control and acknowledgment records can pass queued file data.
-- The server expires idle sessions and rotates them within 15 minutes. Clients keep an idle session
-  warm while the local daemon runs. On a lost session, an in-flight call can have an unknown result.
-  Use detached jobs and their explicit IDs when restart recovery matters.
+- Clients open a fresh session for new calls before the 15-minute limit on opening streams.
+  Existing streams finish on their original session, subject to inactivity and signed grant
+  expiration. Clients keep an idle session warm while the local daemon runs. On a lost session,
+  an in-flight call can have an unknown result. Use detached jobs and their explicit IDs when
+  restart recovery matters.
 
 The current implementation uses bounded copies in the framing and retransmission paths.
 The Windows backend targets x64 Windows 10 version 1809 or newer, including Windows 11.

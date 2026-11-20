@@ -99,8 +99,9 @@ job_spec :: proc(path: string, spec: []byte) -> bool {
     existing, err := os.open(cfg)
     if err != nil { return false }
     defer _ = os.close(existing)
-    data: [MESSAGE_MAX]byte
-    n, read_err := os.read_at_least(existing, data[:], len(spec)+1)
+    data := make([]byte, len(spec)+1)
+    defer delete(data)
+    n, read_err := os.read_at_least(existing, data, len(data))
     return (read_err == nil || read_err == .EOF || read_err == .Unexpected_EOF) &&
            n == len(spec) && string(data[:n]) == string(spec)
 }
@@ -187,7 +188,7 @@ pump_job_list :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bo
     return true
 }
 
-job_status :: proc(path: string) -> (c.int, bool) {
+job_status :: proc(path: string) -> (u32, bool) {
     status := job_file(path, "status")
     defer delete(status)
     file, err := os.open(status)
@@ -195,7 +196,7 @@ job_status :: proc(path: string) -> (c.int, bool) {
     defer _ = os.close(file)
     value: [4]byte
     n, result := os.read_full(file, value[:])
-    return c.int(get_u32(value[:])), n == len(value) && result == nil
+    return get_u32(value[:]), n == len(value) && result == nil
 }
 
 pump_job :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bool {
@@ -242,13 +243,13 @@ pump_job :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bool {
 
 JOB_CHANNELS :: [2]string{"stdout", "stderr"}
 
-persist_job_status :: proc(path: string, code: c.int) -> bool {
+persist_job_status :: proc(path: string, code: u32) -> bool {
     part := job_file(path, "status.part")
     final := job_file(path, "status")
     defer delete(part)
     defer delete(final)
     bytes: [4]byte
-    put_u32(bytes[:], u32(code))
+    put_u32(bytes[:], code)
     file, err := os.open(part, {.Write, .Create, .Excl}, {.Read_User, .Write_User})
     if err != nil { return false }
     n, write_err := os.write(file, bytes[:])
@@ -280,7 +281,7 @@ job_worker :: proc(path, root, expiry_text: string, confined: bool) -> int {
     claim, err := os.open(marker, {.Write, .Create, .Excl}, {.Read_User, .Write_User})
     if err != nil { return 0 }
     _ = os.close(claim)
-    code: c.int = 125
+    code: u32 = 125
     defer _ = persist_job_status(path, code)
 
     root_name := strings.clone_to_cstring(root)
@@ -292,8 +293,9 @@ job_worker :: proc(path, root, expiry_text: string, confined: bool) -> int {
     defer delete(request)
     file, spec_err := os.open(request)
     if spec_err != nil { return 125 }
-    spec: [MESSAGE_MAX]byte
-    n, read_err := os.read_at_least(file, spec[:], len(spec))
+    spec := make([]byte, COMMAND_SPEC_MAX+1)
+    defer delete(spec)
+    n, read_err := os.read_at_least(file, spec, len(spec))
     _ = os.close(file)
     if n < 13 || n >= len(spec) || (read_err != nil && read_err != .Unexpected_EOF && read_err != .EOF) {
         return 125
@@ -351,12 +353,9 @@ job_worker :: proc(path, root, expiry_text: string, confined: bool) -> int {
         if call.pid > 0 {
             result := eco_child_poll(call.pid, &call.exit_code)
             if result < 0 { call.pid = -1; return 125 }
-            if result > 0 {
-                call.pid = -1
-                call.exited_at = time.tick_now()
-            }
+            if result > 0 { call.pid = -1 }
         }
-        if call.pid < 0 && (call.output == {-1, -1} || time.tick_since(call.exited_at) >= time.Second) {
+        if call.pid < 0 && call.output == {-1, -1} {
             code = call.exit_code
             return int(code)
         }

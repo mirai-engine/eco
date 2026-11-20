@@ -89,7 +89,7 @@ static int track(HANDLE process, HANDLE job, HPCON terminal, int terminal_fd, in
     return -1;
 }
 
-int eco_child_poll(int id, int *status) {
+int eco_child_poll(int id, uint32_t *status) {
     if (id <= 0 || id >= CHILDREN || !children[id].process) return -1;
     EcoChild *child = &children[id];
     DWORD wait = WaitForSingleObject(child->process, 0);
@@ -98,7 +98,7 @@ int eco_child_poll(int id, int *status) {
     DWORD code = 0;
     BOOL ok = child->socket_fd >= 0 ? GetExitCodeThread(child->process, &code) :
                                       GetExitCodeProcess(child->process, &code);
-    *status = ok ? (code <= INT_MAX ? (int)code : 125) : 125;
+    *status = ok ? code : 125;
     release_child(child);
     return ok ? id : -1;
 }

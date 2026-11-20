@@ -297,7 +297,7 @@ poll_bulk :: proc(b: ^Bulk_Server, server: ^Server, fds, events: []c.int, count:
     if !b.enabled { return }
     for &pid in b.workers {
         if pid <= 0 { continue }
-        result: c.int
+        result: u32
         if eco_child_poll(pid, &result) != 0 { pid = 0 }
     }
     for &p in b.pending {

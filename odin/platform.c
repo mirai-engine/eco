@@ -421,7 +421,7 @@ int eco_spawn(char *const args[], int fds[2], int workdir, int *to_child, int sc
     return (int)pid;
 }
 
-int eco_child_poll(int pid, int *status) {
+int eco_child_poll(int pid, uint32_t *status) {
     int code = 0;
     int result = waitpid(pid, &code, WNOHANG);
     if (result < 0 && errno == EINTR) return 0;

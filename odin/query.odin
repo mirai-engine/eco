@@ -45,7 +45,14 @@ answer_query :: proc(link: ^Link, request: []byte) {
     }
 }
 
-retry_query :: proc(bridge: ^Bridge, call: ^Local_Call) {
+has_pending_query :: proc(bridge: ^Bridge, link: ^Link) -> bool {
+    for call in bridge.calls {
+        if call != nil && call.query_id != 0 && call.query_link == link { return true }
+    }
+    return false
+}
+
+retry_query :: proc(call: ^Local_Call) {
     now := time.tick_now()
     if call.next_query != {} && time.tick_diff(call.next_query, now) < 0 { return }
     if call.query_attempts >= QUERY_MAX_ATTEMPTS {
@@ -56,19 +63,19 @@ retry_query :: proc(bridge: ^Bridge, call: ^Local_Call) {
     data: [QUERY_PREFIX+MESSAGE_MAX]byte
     put_u32(data[:], call.query_id)
     copy(data[QUERY_PREFIX:], call.input[2:2+call.query_len])
-    link := bridge.link
+    link := call.query_link
     _ = send_record(link, .Query, data[:QUERY_PREFIX+call.query_len], link.remote)
     delay := min(10*time.Millisecond << u32(call.query_attempts), 500*time.Millisecond)
     call.next_query = time.tick_add(now, delay)
     call.query_attempts += 1
 }
 
-receive_query_result :: proc(bridge: ^Bridge, result: []byte) {
+receive_query_result :: proc(bridge: ^Bridge, link: ^Link, result: []byte) {
     if len(result) <= QUERY_PREFIX || len(result) > 256 { return }
     id, op := get_u32(result), Op(result[QUERY_PREFIX])
     if id == 0 || (op != .Done && op != .Failure && op != .Info) { return }
     for call in bridge.calls {
-        if call == nil || call.query_id != id { continue }
+        if call == nil || call.query_id != id || call.query_link != link { continue }
         call.query_id = 0
         call.out_pos, call.out_len = 0, 0
         if op != .Done {

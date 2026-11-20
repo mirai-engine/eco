@@ -53,7 +53,7 @@ run_interactive :: proc(fd: c.int, tty: bool, rows, cols: u16) -> int {
                     }
                 case .Done:
                     if len(body) != 4 { return error_exit("invalid process status") }
-                    return int(get_u32(body))
+                    return process_exit(get_u32(body))
                 case .Failure:
                     return error_exit(string(body))
                 case:

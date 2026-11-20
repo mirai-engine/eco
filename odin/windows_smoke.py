@@ -353,6 +353,15 @@ def main():
                 result = run(*command, env=env, checked=False)
                 assert result.returncode == 7 and result.stdout.strip() == b'spaces " quotes \\|plain\\|'
                 assert result.stderr.strip() == b"err"
+                argument = ('first line "in quotes"\r\nsecond line café\n' * 300) + "end \\"
+                large = run("run", "--", sys.executable, "-c",
+                            "import sys;sys.stdout.buffer.write(sys.argv[1].encode())", argument, env=env)
+                assert large.stdout == argument.encode()
+                status = 0xC0000005
+                for options in ((), ("--stdin",)):
+                    result = run("run", *options, "--", sys.executable, "-c", "raise SystemExit(-1073741819)",
+                                 env=env, checked=False)
+                    assert result.returncode == status and b"0xC0000005" in result.stderr, result
                 echo = run("run", "--stdin", "--", sys.executable, "-c",
                            "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())", env=env, data=data)
                 assert echo.stdout == data

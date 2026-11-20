@@ -29,6 +29,7 @@ Local_Call :: struct {
     used, out_len, out_pos: int,
     complete, disconnecting, batch: bool,
     query_id: u32,
+    query_link: ^Link,
     query_len, query_attempts: int,
     next_query: time.Tick,
     last_touch, opened: time.Tick,
@@ -39,7 +40,8 @@ Bridge :: struct {
     udp: net.UDP_Socket,
     udp_fd: c.int,
     link: ^Link,
-    serial, query_serial: u32,
+    links: [STREAM_MAX]^Link,
+    query_serial: u32,
     own: ^ecdh.Private_Key,
     peer: ^ecdh.Public_Key,
     calls: [STREAM_MAX]^Local_Call,
@@ -93,12 +95,12 @@ local_failure :: proc(call: ^Local_Call, message: string) {
     call.complete = true
 }
 
-close_local :: proc(bridge: ^Bridge, slot: ^^Local_Call) {
+close_local :: proc(slot: ^^Local_Call) {
     if slot^ == nil { return }
     call := slot^
     close_fd(&call.fd)
-    if call.stream != nil && bridge.link != nil {
-        for &stream in bridge.link.streams {
+    if call.stream != nil {
+        for &stream in call.stream.link.streams {
             if stream == call.stream {
                 free_stream(&stream)
                 break
@@ -112,15 +114,20 @@ close_local :: proc(bridge: ^Bridge, slot: ^^Local_Call) {
 
 connect_bridge :: proc(bridge: ^Bridge) -> bool {
     if bridge.link != nil { return true }
-    link := new(Link)
-    if !connect_link(bridge.udp, bridge.endpoint, bridge.own, bridge.peer, bridge.token, false, link, bridge.udp_fd) {
-        free(link)
-        return false
+    for &slot in bridge.links {
+        if slot != nil { continue }
+        link := new(Link)
+        if !connect_link(bridge.udp, bridge.endpoint, bridge.own, bridge.peer, bridge.token,
+                         false, link, bridge.udp_fd) {
+            free(link)
+            return false
+        }
+        slot = link
+        bridge.link = link
+        bridge.keepalive = time.tick_now()
+        return true
     }
-    bridge.link = link
-    bridge.keepalive = time.tick_now()
-    bridge.serial = 0
-    return true
+    return false
 }
 
 read_call_input :: proc(call: ^Local_Call) -> ([]byte, bool) {
@@ -167,7 +174,7 @@ forward_local :: proc(bridge: ^Bridge, call: ^Local_Call) -> bool {
     if call.disconnecting && time.tick_since(call.opened) >= 2*time.Second { return false }
     if call.query_id != 0 {
         if call.fd < 0 { return false }
-        retry_query(bridge, call)
+        retry_query(call)
         return true
     }
     if call.stream == nil && !call.batch && time.tick_since(call.opened) >= 10*time.Second { return false }
@@ -197,14 +204,14 @@ forward_local :: proc(bridge: ^Bridge, call: ^Local_Call) -> bool {
                     bridge.query_serial += 1
                     if bridge.query_serial == 0 { bridge.query_serial = 1 }
                     call.query_id = bridge.query_serial
+                    call.query_link = bridge.link
                     call.query_len = len(message)
                     call.query_attempts = 0
                     call.next_query = {}
-                    retry_query(bridge, call)
+                    retry_query(call)
                     return true
                 }
-                bridge.serial += 1
-                call.stream = new_stream(bridge.link, bridge.serial)
+                call.stream = new_stream(bridge.link, bridge.link.high_stream+1)
                 if call.stream == nil {
                     local_failure(call, "no remote stream available")
                     return true
@@ -281,8 +288,8 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
     defer eco_ring_close()
     bridge := Bridge{endpoint = endpoint, udp = udp, udp_fd = udp_fd, own = own, peer = peer, idle = time.tick_now(), token = token}
     defer {
-        for &call in bridge.calls { close_local(&bridge, &call) }
-        if bridge.link != nil { close_client_link(&bridge.link) }
+        for &call in bridge.calls { close_local(&call) }
+        for &link in bridge.links { if link != nil { close_client_link(&link) } }
     }
     packet: [MAX_PACKET+1]byte
     scratch: [KCP_MTU]byte
@@ -290,16 +297,18 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
         for _ in 0..<64 {
             n, from, read_err := net.recv_udp(udp, packet[:])
             if read_err != nil { break }
-            if bridge.link == nil { continue }
             header, ok := parse_header(packet[:n])
-            if ok && header.id == bridge.link.id {
-                if result := receive_record(bridge.link, header, from, packet[:n], scratch[:], false); result != nil {
+            if !ok { continue }
+            for link in bridge.links {
+                if link == nil || header.id != link.id { continue }
+                if result := receive_record(link, header, from, packet[:n], scratch[:], false); result != nil {
                     if header.kind == .Desktop_Frame {
-                        receive_desktop_frame(&bridge, result)
+                        receive_desktop_frame(&bridge, link, result)
                     } else {
-                        receive_query_result(&bridge, result)
+                        receive_query_result(&bridge, link, result)
                     }
                 }
+                break
             }
         }
         for &call in bridge.calls {
@@ -316,10 +325,21 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
         count := 2
         active := false
         deadline: c.int = 1000
+        if link := bridge.link; link != nil &&
+           (link.closing || time.tick_since(link.seen) > 60*time.Second ||
+            time.tick_since(link.born) >= SESSION_LIFETIME-time.Minute ||
+            link.high_stream >= max(u32)-STREAM_HISTORY || link.send_number >= RECORD_LIMIT/2) {
+            bridge.link = nil
+        }
+        for &link in bridge.links {
+            if link != nil && link != bridge.link && !has_streams(link) && !has_pending_query(&bridge, link) {
+                close_client_link(&link)
+            }
+        }
         for &call in bridge.calls {
             if call == nil { continue }
             if !forward_local(&bridge, call) {
-                close_local(&bridge, &call)
+                close_local(&call)
                 continue
             }
             if call.stream != nil || call.query_id != 0 {
@@ -347,16 +367,11 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
             _ = send_record(bridge.link, .Keepalive, []byte{0}, bridge.link.remote)
             bridge.keepalive = time.tick_now()
         }
-        if !active {
-            if time.tick_since(bridge.idle) >= IDLE_LIFETIME { break }
-            if bridge.link != nil {
-                if time.tick_since(bridge.link.seen) > 60*time.Second ||
-                   time.tick_since(bridge.link.born) >= SESSION_LIFETIME-time.Minute || bridge.serial >= max(u32)-STREAM_HISTORY {
-                    close_client_link(&bridge.link)
-                }
-            }
+        if !active && time.tick_since(bridge.idle) >= IDLE_LIFETIME { break }
+        for &link in bridge.links {
+            if link == nil { continue }
+            if drain_pacer(link) { deadline = min(deadline, 1) }
         }
-        if bridge.link != nil && drain_pacer(bridge.link) { deadline = min(deadline, 1) }
         _ = eco_poll(raw_data(fds[:]), raw_data(events[:]), c.int(count), deadline)
     }
     return 0

@@ -49,7 +49,7 @@ foreign platform {
     eco_terminal_size :: proc(fd: c.int, rows, cols: ^u16) -> c.int ---
     eco_terminal_restore :: proc() ---
     eco_terminal_raw :: proc(fd: c.int) -> c.int ---
-    eco_child_poll :: proc(pid: c.int, status: ^c.int) -> c.int ---
+    eco_child_poll :: proc(pid: c.int, status: ^u32) -> c.int ---
     eco_child_kill :: proc(pid: c.int) ---
     eco_child_events :: proc() -> c.int ---
     eco_scope_supported :: proc() -> c.int ---
@@ -79,6 +79,8 @@ MAX_PACKET :: 1200
 KCP_MTU :: MAX_PACKET - HEADER_SIZE - noise.TAG_SIZE
 KCP_OVERHEAD :: 24
 MESSAGE_MAX :: KCP_MTU - KCP_OVERHEAD
+COMMAND_SPEC_MAX :: 128*1024
+COMMAND_SIZE_ERROR :: "command arguments and working directory exceed 128 KiB"
 STREAM_MAX :: 16
 STREAM_HISTORY :: 128
 REPLAY_WINDOW :: 512
@@ -138,6 +140,11 @@ Stream :: struct {
     last_seen, began: time.Tick,
     application: rawptr,
     finished, bulk: bool,
+}
+
+has_streams :: proc(link: ^Link) -> bool {
+    for stream in link.streams { if stream != nil { return true } }
+    return false
 }
 
 get_u32 :: proc(data: []byte) -> u32 {
@@ -469,7 +476,8 @@ receive_record :: proc(link: ^Link, header: Record, from: net.Endpoint, packet, 
     if header.kind != .Data || !valid_segments(plain) { return nil }
     id := get_u32(plain)
     stream := find_stream(link, id)
-    if stream == nil && accept_new && plain[4] == 81 && get_u32(plain[12:]) == 0 {
+    if stream == nil && accept_new && time.tick_since(link.born) < SESSION_LIFETIME &&
+       plain[4] == 81 && get_u32(plain[12:]) == 0 {
         stream = new_stream(link, id)
     }
     if stream == nil { return nil }

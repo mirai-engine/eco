@@ -82,12 +82,12 @@ receive_video_chunk :: proc(video: ^Video_Receiver, packet: []byte) {
     }
 }
 
-receive_desktop_frame :: proc(bridge: ^Bridge, packet: []byte) {
+receive_desktop_frame :: proc(bridge: ^Bridge, link: ^Link, packet: []byte) {
     if len(packet) <= VIDEO_CHUNK_HEADER { return }
     stream := get_u32(packet)
     for call in bridge.calls {
         if call != nil && call.video != nil && call.stream != nil && call.stream.id == stream &&
-           !call.complete && !call.disconnecting {
+           call.stream.link == link && !call.complete && !call.disconnecting {
             receive_video_chunk(call.video, packet)
             return
         }

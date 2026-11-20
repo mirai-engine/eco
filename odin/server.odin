@@ -12,7 +12,7 @@ import "deps:blake3"
 Op :: enum u8 {
     Ping = 1, Stat, List, Read, Write, Hash, Watch, Run, Tty, Tcp, Udp, Start, Attach, Jobs, Kill,
     Upload = 16, Commit, Cancel, Touch, Input, Input_End, Resize, Session,
-    Desktop_Capture = 24, Desktop_Stream, Desktop_Input,
+    Desktop_Capture = 24, Desktop_Stream, Desktop_Input, Command_Spec, Arguments,
     Stdout = 32, Stderr, Entry, Info, Digest, Done, Failure, Ready, Output_End,
 }
 
@@ -46,10 +46,12 @@ Server_Call :: struct {
     leaf, temp: [256]byte,
     hashing: blake3.Hasher,
     done, committed, connecting, input_end, output_end: bool,
-    deadline, poll_at, exited_at: time.Tick,
+    deadline, poll_at: time.Tick,
     size, stamp: u64,
     kind: u8,
-    exit_code: c.int,
+    exit_code: u32,
+    command_data: []byte,
+    command_used: int,
     desktop: ^Desktop_Call,
     job_path: string,
     job_output: [2]^os.File,
@@ -61,9 +63,9 @@ reply :: proc(stream: ^Stream, op: Op, body: []byte = nil) {
     _ = send_message(stream, u8(op), body)
 }
 
-finish_call :: proc(stream: ^Stream, call: ^Server_Call, code: c.int) {
+finish_call :: proc(stream: ^Stream, call: ^Server_Call, code: u32) {
     value: [4]byte
-    put_u32(value[:], u32(code))
+    put_u32(value[:], code)
     reply(stream, .Done, value[:])
     call.done = true
 }
@@ -87,6 +89,7 @@ dispose_call :: proc(call: ^Server_Call) {
     if call.desktop != nil { dispose_desktop(call.desktop) }
     for file in call.job_output { if file != nil { _ = os.close(file) } }
     if call.job_path != "" { delete(call.job_path) }
+    if call.command_data != nil { delete(call.command_data) }
     close_fd(&call.input)
     close_fd(&call.output[0])
     close_fd(&call.output[1])
@@ -146,7 +149,7 @@ stat_call :: proc(stream: ^Stream, call: ^Server_Call, first: bool) -> bool {
 }
 
 start_process :: proc(root: c.int, call: ^Server_Call, data: []byte, confined := false) -> string {
-    if len(data) < 13 || data[len(data)-1] != 0 {
+    if len(data) < 13 || len(data) > COMMAND_SPEC_MAX || data[len(data)-1] != 0 {
         return "invalid run arguments"
     }
     timeout := get_u32(data)
@@ -209,20 +212,48 @@ open_run :: proc(stream: ^Stream, call: ^Server_Call, body: []byte) {
 
 open_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message: []byte) {
     call.op = Op(message[0])
-    stream.bulk = call.op == .Read || call.op == .Write
     body := message[1:]
+    if call.op != .Command_Spec {
+        open_operation(server, stream, call, body)
+        return
+    }
+
+    if len(body) != 5 {
+        fail_call(stream, call, "invalid command header")
+        return
+    }
+    call.op = Op(body[0])
+    size := int(get_u32(body[1:]))
+    if (call.op != .Run && call.op != .Tty && call.op != .Start) ||
+       size < MESSAGE_MAX || size > COMMAND_SPEC_MAX {
+        fail_call(stream, call, "invalid command type or argument size")
+        return
+    }
+    if !allow_command(server, stream, call) { return }
+    call.command_data = make([]byte, size)
+    reply(stream, .Ready)
+}
+
+allow_command :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call) -> bool {
+    allowed := server.access == .Run && stream.link.rights & CAP_RUN != 0
+    if call.op >= .Start && call.op <= .Kill {
+        allowed = allowed && server.jobs != "" && (!stream.link.confined || eco_scope_supported() == 1)
+        if !allowed { fail_call(stream, call, "persistent jobs are disabled") }
+    } else if !allowed {
+        fail_call(stream, call, "execution is disabled")
+    }
+    return allowed
+}
+
+open_operation :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, body: []byte) {
+    stream.bulk = call.op == .Read || call.op == .Write
     if call.op == .Ping {
         if len(body) != 0 { fail_call(stream, call, "invalid ping"); return }
         finish_call(stream, call, 0)
         return
     }
     if call.op >= .Start && call.op <= .Kill {
-        if server.access != .Run || stream.link.rights & CAP_RUN == 0 ||
-           (stream.link.confined && eco_scope_supported() != 1) || server.jobs == "" {
-            fail_call(stream, call, "persistent jobs are disabled")
-            return
-        }
-        open_job(server, stream, call, body)
+        if allow_command(server, stream, call) { open_job(server, stream, call, body) }
         return
     }
     if call.op == .Tcp || call.op == .Udp {
@@ -234,8 +265,7 @@ open_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message:
         return
     }
     if call.op == .Run || call.op == .Tty {
-        if server.access != .Run || stream.link.rights & CAP_RUN == 0 { fail_call(stream, call, "execution is disabled"); return }
-        open_run(stream, call, body)
+        if allow_command(server, stream, call) { open_run(stream, call, body) }
         return
     }
     if call.op >= .Desktop_Capture && call.op <= .Desktop_Input {
@@ -300,12 +330,26 @@ write_fd :: proc(fd: c.int, data: []byte) -> bool {
     return true
 }
 
-receive_call :: proc(stream: ^Stream, call: ^Server_Call, message: []byte) {
+receive_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message: []byte) {
     op := Op(message[0])
     body := message[1:]
     if op == .Touch && len(body) == 0 { return }
     if op == .Cancel && len(body) == 0 {
         finish_call(stream, call, 130)
+        return
+    }
+    if call.command_data != nil {
+        pending := call.command_data[call.command_used:]
+        if op != .Arguments || len(body) == 0 || len(body) > len(pending) {
+            fail_call(stream, call, "invalid command arguments")
+            return
+        }
+        call.command_used += copy(pending, body)
+        if call.command_used == len(call.command_data) {
+            open_operation(server, stream, call, call.command_data)
+            delete(call.command_data)
+            call.command_data = nil
+        }
         return
     }
     if call.op == .Tcp || call.op == .Udp {
@@ -372,7 +416,6 @@ receive_call :: proc(stream: ^Stream, call: ^Server_Call, message: []byte) {
 }
 
 pump_run :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bool {
-    now := time.tick_now()
     progressed := false
     for &fd, i in call.output {
         if fd < 0 { continue }
@@ -396,13 +439,9 @@ pump_run :: proc(stream: ^Stream, call: ^Server_Call, buffer: []byte) -> bool {
             fail_call(stream, call, "cannot reap process")
             return false
         }
-        if result > 0 {
-            call.pid = -1
-            call.exited_at = now
-        }
+        if result > 0 { call.pid = -1 }
     }
-    if call.pid < 0 && (call.output == {-1, -1} || (!progressed && time.tick_since(call.exited_at) > 100*time.Millisecond) ||
-                        time.tick_since(call.exited_at) > time.Second) {
+    if call.pid < 0 && call.output == {-1, -1} {
         finish_call(stream, call, call.exit_code)
     }
     return progressed
@@ -470,8 +509,8 @@ process_stream :: proc(server: ^Server, slot: ^^Stream) -> bool {
     progressed := false
     if call != nil {
         if (call.op == .Run || call.op == .Tty) && !call.done &&
-           call.pid > 0 && time.tick_since(call.deadline) >= 0 {
-            eco_child_kill(call.pid)
+           call.deadline != {} && time.tick_since(call.deadline) >= 0 {
+            if call.pid > 0 { eco_child_kill(call.pid) }
             call.pid = -1
             fail_call(stream, call, "execution timed out")
         }
@@ -482,10 +521,10 @@ process_stream :: proc(server: ^Server, slot: ^^Stream) -> bool {
             }
             message := read_message(stream, buffer[:])
             if message == nil { break }
-            receive_call(stream, call, message)
+            receive_call(server, stream, call, message)
         }
         for i in 0..<window_for(stream) {
-            if call.done || ikcp_waitsnd(stream.kcp) >= c.int(window_for(stream)) { break }
+            if call.done || call.command_data != nil || ikcp_waitsnd(stream.kcp) >= c.int(window_for(stream)) { break }
             if !pump_call(stream, call, buffer[:MESSAGE_MAX-1]) { break }
             progressed = true
         }
@@ -516,8 +555,7 @@ receive_server :: proc(server: ^Server, packet, scratch: []byte, from: net.Endpo
                 _, _ = net.send_udp(server.udp, link.server_hello[:link.welcome_len], from)
             }
         } else {
-            if link.closing || time.tick_since(link.born) >= SESSION_LIFETIME ||
-               (link.grant_expiry != 0 && u64(time.to_unix_seconds(time.now())) >= link.grant_expiry) {
+            if link.closing || (link.grant_expiry != 0 && u64(time.to_unix_seconds(time.now())) >= link.grant_expiry) {
                 return
             }
             if query := receive_record(link, header, from, packet, scratch, true); query != nil {
@@ -600,7 +638,8 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
         for &link in server.links {
             if link == nil { continue }
             if link.closing || (link.grant_expiry != 0 && u64(time.to_unix_seconds(time.now())) >= link.grant_expiry) ||
-               time.tick_since(link.born) >= SESSION_LIFETIME || time.tick_since(link.seen) >= IDLE_LIFETIME ||
+               (time.tick_since(link.born) >= SESSION_LIFETIME && !has_streams(link)) ||
+               time.tick_since(link.seen) >= IDLE_LIFETIME ||
                (!link.verified && time.tick_since(link.born) >= 4*time.Second) {
                 close_link(&link)
                 continue

@@ -80,6 +80,26 @@ def test_terminal(env):
     print("PTY, resize, stdin, and watch passed", flush=True)
 
 
+def test_run_output(env):
+    message = ('first line "in quotes"\r\nsecond line\n' * 300) + "end"
+    output = cli("run", "--", "/usr/bin/printf", "%s", message, env=env).stdout
+    assert output == message.encode()
+    too_large = cli("run", "--", "/usr/bin/printf", "%s", "x" * (128 * 1024 - 1),
+                    env=env, check=False)
+    assert too_large.returncode and b"command arguments and working directory exceed" in too_large.stderr
+
+    command = [BINARY, "run", "--", "/usr/bin/head", "-c", str(256 * 1024), "/dev/zero"]
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        time.sleep(1.5)
+        output, errors = process.communicate(timeout=8)
+    assert process.returncode == 0 and output == bytes(256 * 1024), (len(output), errors)
+
+    inherited = "printf early; (sleep 0.35; printf late) &"
+    result = cli("run", "--timeout-ms", "3000", "--", "/bin/sh", "-c", inherited, env=env)
+    assert result.stdout == b"earlylate"
+    print("long command arguments and complete process output passed", flush=True)
+
+
 def test_tunnels(env):
     with socket.socket() as target:
         target.bind(("127.0.0.1", 0))
@@ -327,7 +347,8 @@ def test_bulk(base, root, server_secret, server_key, client_secret, client_key, 
 
 
 def test_jobs(stack, base, root, port, server_secret, client_secret, server_key, client_key, env):
-    argv = ("--", "/bin/sh", "-c", "printf one; sleep 2; printf two; printf err >&2; exit 7")
+    command = "printf one; sleep 2; printf two; printf err >&2; exit 7\n#" + "x" * 4096
+    argv = ("--", "/bin/sh", "-c", command)
     job = cli("start", *argv, env=env).stdout.decode().strip()
     assert len(job) == 32 and cli("start", "--id", job, *argv, env=env).stdout.decode().strip() == job
     assert cli("start", "--id", job, "--", "/bin/echo", "different", env=env, check=False).returncode
@@ -367,6 +388,7 @@ def main():
             client = stack.enter_context(background("client", local, endpoint(port), client_secret, server_key))
             wait_ready(local, client)
             test_terminal(env)
+            test_run_output(env)
             test_tunnels(env)
             test_faults(base, port, client_secret, server_key, env)
             test_capabilities(base, root, server_secret, server_key, client_secret, client_key, env)

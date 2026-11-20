@@ -50,6 +50,14 @@ error_exit :: proc(message: string, detail: any = nil) -> int {
     return 125
 }
 
+process_exit :: proc(code: u32) -> int {
+    if code > 255 {
+        fmt.eprintfln("eco-odin: remote process exited with status 0x%08X", code)
+        when ODIN_OS != .Windows { return 125 }
+    }
+    return int(code)
+}
+
 keygen :: proc(path: string) -> int {
     key: ecdh.Private_Key
     defer ecdh.private_key_clear(&key)
@@ -187,12 +195,12 @@ dial_local :: proc() -> c.int {
         if fd >= 0 { return fd }
         time.sleep(5*time.Millisecond)
     }
-    status: c.int
+    status: u32
     _ = eco_child_poll(pid, &status)
     return -1
 }
 
-run_payload :: proc(args: []string, buf: []byte, tty: bool, rows, cols: u16) -> (result: []byte, ok: bool) {
+run_payload :: proc(args: []string, buf: []byte, tty: bool, rows, cols: u16) -> (result: []byte, error: string) {
     timeout := 60*60*1000
     cwd := "."
     with_input := tty
@@ -203,33 +211,55 @@ run_payload :: proc(args: []string, buf: []byte, tty: bool, rows, cols: u16) -> 
             i += 1
             continue
         }
-        if i+1 >= len(args) { return nil, false }
+        if i+1 >= len(args) { return nil, USAGE }
         switch args[i] {
         case "--cwd":
             cwd = args[i+1]
         case "--timeout-ms":
             value, valid := strconv.parse_int(args[i+1], 10)
-            if !valid || value <= 0 || value > 24*60*60*1000 { return nil, false }
+            if !valid || value <= 0 || value > 24*60*60*1000 { return nil, USAGE }
             timeout = value
         case:
-            return nil, false
+            return nil, USAGE
         }
         i += 2
     }
-    if i+1 >= len(args) || cwd == "" || len(args)-i-1 > 64 || args[i+1] == "" { return nil, false }
+    if i+1 >= len(args) || cwd == "" || args[i+1] == "" { return nil, USAGE }
+    if len(args)-i-1 > 64 { return nil, "a command accepts at most 64 arguments including the executable" }
     put_u32(buf, u32(timeout))
     buf[4] = 1 if with_input else 0
     encode_size(buf[5:9], rows, cols)
     n := 9
-    if len(cwd)+1 > len(buf)-n { return nil, false }
+    if len(cwd)+1 > len(buf)-n { return nil, COMMAND_SIZE_ERROR }
     copy(buf[n:], cwd)
     n += len(cwd)+1
     for arg in args[i+1:] {
-        if len(arg)+1 > len(buf)-n { return nil, false }
+        if len(arg)+1 > len(buf)-n { return nil, COMMAND_SIZE_ERROR }
         copy(buf[n:], arg)
         n += len(arg)+1
     }
-    return buf[:n], true
+    return buf[:n], ""
+}
+
+send_command :: proc(fd: c.int, op: Op, payload: []byte) -> string {
+    if len(payload) < MESSAGE_MAX {
+        return "" if send_local(fd, op, payload) else "cannot send command arguments"
+    }
+    header: [5]byte
+    header[0] = byte(op)
+    put_u32(header[1:], u32(len(payload)))
+    if !send_local(fd, .Command_Spec, header[:]) { return "cannot send command header" }
+    response_buffer: [MESSAGE_MAX]byte
+    response := read_local(fd, response_buffer[:])
+    if response == nil { return "connection lost while opening command" }
+    if Op(response[0]) == .Failure { return strings.clone(string(response[1:]), context.temp_allocator) }
+    if len(response) != 1 || Op(response[0]) != .Ready { return "invalid command response" }
+    for offset := 0; offset < len(payload); offset += MESSAGE_MAX-1 {
+        if !send_local(fd, .Arguments, payload[offset:min(offset+MESSAGE_MAX-1, len(payload))]) {
+            return "cannot send command arguments"
+        }
+    }
+    return ""
 }
 
 perform_upload :: proc(fd: c.int, input: ^os.File) -> bool {
@@ -264,7 +294,8 @@ command_cli :: proc(args: []string) -> int {
     op: Op
     path, local: string
     payload: []byte
-    run_data: [MESSAGE_MAX-1]byte
+    command_data: []byte
+    defer if command_data != nil { delete(command_data) }
     term_rows, term_cols: u16
     desktop_data: [MESSAGE_MAX-1]byte
     job_data: [MESSAGE_MAX-1]byte
@@ -284,9 +315,12 @@ command_cli :: proc(args: []string) -> int {
         } else {
             random_bytes(job_data[:JOB_ID])
         }
-        run, valid := run_payload(rest, job_data[JOB_ID:], false, 0, 0)
-        if !valid || job_data[JOB_ID+4] != 0 { return error_exit(USAGE) }
-        payload, op = job_data[:JOB_ID+len(run)], .Start
+        command_data = make([]byte, COMMAND_SPEC_MAX)
+        copy(command_data, job_data[:JOB_ID])
+        run, error := run_payload(rest, command_data[JOB_ID:], false, 0, 0)
+        if error != "" { return error_exit(error) }
+        if run[4] != 0 { return error_exit("background jobs require a command without stdin") }
+        payload, op = command_data[:JOB_ID+len(run)], .Start
     case "attach", "kill":
         attaching := command == "attach"
         if len(args) != 2 && !(attaching && len(args) == 4) { return error_exit(USAGE) }
@@ -311,9 +345,10 @@ command_cli :: proc(args: []string) -> int {
         if tty && eco_terminal_size(0, &term_rows, &term_cols) != 0 {
             return error_exit("tty requires an interactive local terminal")
         }
-        var_ok: bool
-        payload, var_ok = run_payload(args[1:], run_data[:], tty, term_rows, term_cols)
-        if !var_ok { return error_exit(USAGE) }
+        command_data = make([]byte, COMMAND_SPEC_MAX)
+        error: string
+        payload, error = run_payload(args[1:], command_data, tty, term_rows, term_cols)
+        if error != "" { return error_exit(error) }
         op = .Tty if tty else .Run
     case "get", "put":
         if len(args) != 3 { return error_exit(USAGE) }
@@ -364,8 +399,10 @@ command_cli :: proc(args: []string) -> int {
         _ = os.remove(temp)
     }
 
-    if !send_local(fd, op, payload) { return error_exit("cannot send local request") }
-    if (op == .Run || op == .Tty) && run_data[4] == 1 {
+    if command_data != nil {
+        if error := send_command(fd, op, payload); error != "" { return error_exit(error) }
+    } else if !send_local(fd, op, payload) { return error_exit("cannot send local request") }
+    if (op == .Run || op == .Tty) && payload[4] == 1 {
         return run_interactive(fd, op == .Tty, term_rows, term_cols)
     }
 
@@ -385,8 +422,8 @@ command_cli :: proc(args: []string) -> int {
             return error_exit(string(body))
         case .Done:
             if len(body) != 4 { return error_exit("invalid exit status") }
-            result := int(get_u32(body))
-            if result != 0 { return result }
+            result := get_u32(body)
+            if result != 0 { return process_exit(result) }
             if op == .Read && !verified { return error_exit("missing file digest") }
             if temp != "" {
                 sync_err := os.sync(output)
