@@ -49,6 +49,8 @@ foreign platform {
     eco_terminal_size :: proc(fd: c.int, rows, cols: ^u16) -> c.int ---
     eco_terminal_restore :: proc() ---
     eco_terminal_raw :: proc(fd: c.int) -> c.int ---
+    eco_stdin_piped :: proc() -> c.int ---
+    eco_ensure_private_dir :: proc(name: cstring) -> c.int ---
     eco_child_poll :: proc(pid: c.int, status: ^u32) -> c.int ---
     eco_child_kill :: proc(pid: c.int) ---
     eco_child_events :: proc() -> c.int ---

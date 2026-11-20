@@ -368,6 +368,12 @@ def main():
                     result = run("run", *options, "--", sys.executable, "-c", "raise SystemExit(-1073741819)",
                                  env=env, checked=False)
                     assert result.returncode == status and b"0xC0000005" in result.stderr, result
+                auto_echo = run("run", "--", sys.executable, "-c",
+                                "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())", env=env, data=b"auto-stdin")
+                assert auto_echo.stdout == b"auto-stdin", auto_echo.stdout
+                no_stdin = run("run", "--no-stdin", "--", sys.executable, "-c",
+                               "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())", env=env, data=b"ignored")
+                assert no_stdin.stdout == b"", no_stdin.stdout
                 echo = run("run", "--stdin", "--", sys.executable, "-c",
                            "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())", env=env, data=data)
                 assert echo.stdout == data

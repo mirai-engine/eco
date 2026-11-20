@@ -376,6 +376,13 @@ static int socket_events(EcoDescriptor *entry, int mask) {
     return result;
 }
 
+int eco_stdin_piped(void) {
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (!input || input == INVALID_HANDLE_VALUE) return 0;
+    DWORD type = GetFileType(input);
+    return (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) ? 1 : 0;
+}
+
 static int stdin_events(void) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
     if (!input || input == INVALID_HANDLE_VALUE) return ECO_HUP;

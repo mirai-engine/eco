@@ -464,6 +464,18 @@ int eco_check_private_dir(const char *name) {
     return lstat(name, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == geteuid() && (st.st_mode & 0077) == 0;
 }
 
+int eco_ensure_private_dir(const char *name) {
+    if (eco_check_private_dir(name)) return 1;
+    (void)mkdir(name, 0700);
+    return eco_check_private_dir(name);
+}
+
+int eco_stdin_piped(void) {
+    struct stat st;
+    if (fstat(0, &st) != 0) return 0;
+    return (S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode)) ? 1 : 0;
+}
+
 int eco_prepare_socket(const char *name) {
     struct stat st;
     if (lstat(name, &st) < 0) return errno == ENOENT ? 0 : -1;

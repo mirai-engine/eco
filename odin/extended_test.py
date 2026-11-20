@@ -42,6 +42,8 @@ def set_size(terminal, rows, cols):
 
 
 def test_terminal(env):
+    assert cli("run", "--", "/bin/cat", data=b"auto\0piped\n", env=env).stdout == b"auto\0piped\n"
+    assert cli("run", "--no-stdin", "--", "/bin/cat", data=b"ignored\n", env=env).stdout == b""
     assert cli("run", "--stdin", "--", "/bin/cat", data=b"raw\0bytes\n", env=env).stdout == b"raw\0bytes\n"
     larger = os.urandom(2*1024*1024)
     echo = cli("run", "--stdin", "--", "/bin/cat", data=larger, env=env)
@@ -412,6 +414,20 @@ def test_jobs(stack, base, root, port, server_secret, client_secret, server_key,
         running = cli("start", "--", "/bin/sleep", "20", env=env).stdout.decode().strip()
         cli("kill", running, env=env)
         assert cli("attach", running, env=env, check=False).returncode == 130
+
+    default_home = base / "default-home"
+    default_env = {k: v for k, v in env.items() if k != "ECO_ODIN_JOBS"}
+    default_env["ECO_ODIN_HOME"] = str(default_home)
+    default_port, default_local = port_for(), base / "s-default"
+    default_env["ECO_ODIN_SOCKET"] = str(default_local)
+    with ExitStack() as default_stack:
+        s = default_stack.enter_context(background("serve", endpoint(default_port), server_secret, base / "clients", root, "run", env=default_env))
+        assert b"listening" in s.stderr.readline()
+        c = default_stack.enter_context(background("client", default_local, endpoint(default_port), client_secret, server_key))
+        wait_ready(default_local, c)
+        default_job = cli("start", "--", "/bin/echo", "default-jobs", env=default_env).stdout.decode().strip()
+        assert len(default_job) == 32 and cli("attach", default_job, env=default_env).stdout.strip() == b"default-jobs"
+        assert (default_home / "jobs").is_dir()
     print("detached job survived daemon restart, offsets and cancel passed", flush=True)
 
 

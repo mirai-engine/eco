@@ -28,7 +28,7 @@ USAGE :: `usage: eco-odin COMMAND
   get REMOTE LOCAL
   write REMOTE                       read bytes from stdin
   put LOCAL REMOTE
-  run [--stdin] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
+  run [--stdin|--no-stdin] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
   start [--id HEX] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
   attach ID [STDOUT_OFFSET STDERR_OFFSET] | jobs | kill ID
   desktop capture | stream [FPS]     write a JPEG or a stream of JPEGs
@@ -130,9 +130,14 @@ dispatch_platform :: proc(args: []string) -> int {
             policy.required = true
             ecdh.private_key_public_bytes(&own, policy.server_key[:])
         }
-        jobs_buffer: [1024]byte
-        jobs := os.get_env(jobs_buffer[:], "ECO_ODIN_JOBS")
-        if jobs != "" {
+        jobs, jobs_set := os.lookup_env("ECO_ODIN_JOBS", context.temp_allocator)
+        if !jobs_set && access == .Run {
+            if home := eco_home(); home != "" && os.is_absolute_path(home) {
+                candidate := fmt.tprintf("%s/jobs", home)
+                cname := strings.clone_to_cstring(candidate, context.temp_allocator)
+                if eco_ensure_private_dir(cname) == 1 { jobs = candidate }
+            }
+        } else if jobs != "" {
             name := strings.clone_to_cstring(jobs, context.temp_allocator)
             if !(os.is_absolute_path(jobs)) || eco_check_private_dir(name) != 1 {
                 return error_exit("ECO_ODIN_JOBS must be an absolute, private directory owned by you")
@@ -200,14 +205,19 @@ dial_local :: proc() -> c.int {
     return -1
 }
 
-run_payload :: proc(args: []string, buf: []byte, tty: bool, rows, cols: u16) -> (result: []byte, error: string) {
+run_payload :: proc(args: []string, buf: []byte, tty, default_stdin: bool, rows, cols: u16) -> (result: []byte, error: string) {
     timeout := 60*60*1000
     cwd := "."
-    with_input := tty
+    with_input := tty || default_stdin
     i := 0
     for i < len(args) && args[i] != "--" {
         if args[i] == "--stdin" && !tty {
             with_input = true
+            i += 1
+            continue
+        }
+        if args[i] == "--no-stdin" && !tty {
+            with_input = false
             i += 1
             continue
         }
@@ -317,7 +327,7 @@ command_cli :: proc(args: []string) -> int {
         }
         command_data = make([]byte, COMMAND_SPEC_MAX)
         copy(command_data, job_data[:JOB_ID])
-        run, error := run_payload(rest, command_data[JOB_ID:], false, 0, 0)
+        run, error := run_payload(rest, command_data[JOB_ID:], false, false, 0, 0)
         if error != "" { return error_exit(error) }
         if run[4] != 0 { return error_exit("background jobs require a command without stdin") }
         payload, op = command_data[:JOB_ID+len(run)], .Start
@@ -347,7 +357,7 @@ command_cli :: proc(args: []string) -> int {
         }
         command_data = make([]byte, COMMAND_SPEC_MAX)
         error: string
-        payload, error = run_payload(args[1:], command_data, tty, term_rows, term_cols)
+        payload, error = run_payload(args[1:], command_data, tty, !tty && eco_stdin_piped() == 1, term_rows, term_cols)
         if error != "" { return error_exit(error) }
         op = .Tty if tty else .Run
     case "get", "put":

@@ -96,7 +96,8 @@ eco-odin kill "$job"
 
 `run`, `tty` and `start` accept command arguments and a working directory totaling up to
 128 KiB of encoded request data. The remote operating system can impose a smaller limit.
-Use `run --stdin` for script input or other streamed data. A command's timeout includes draining
+`run` automatically forwards piped or redirected stdin; pass `--stdin` to force forwarding or
+`--no-stdin` to close remote stdin immediately. A command's timeout includes draining
 its output. A responsive stream stays open even while a command produces no output.
 Windows exit codes above 255 are printed in hexadecimal. On macOS and Linux
 the CLI returns 125 for those codes because the local process status has only eight bits.
@@ -123,7 +124,8 @@ queue per sender.
 `start --id HEX` accepts a 32-character idempotency key. A detached worker owns the process and
 spools stdout, stderr and the exit status to disk. `attach` works across server and client daemon
 restarts. A worker that exits without publishing a result leaves an indeterminate job and the server
-does not rerun it. Set `ECO_ODIN_JOBS` on the server to enable background job storage.
+does not rerun it. When `serve ... run` starts without `ECO_ODIN_JOBS` set, Eco uses a private
+`ECO_ODIN_HOME/jobs` directory automatically; set `ECO_ODIN_JOBS=` (empty) to disable background jobs.
 Jobs retain at most 64 MiB per output stream and remain on disk until the operator removes them.
 A machine reboot can terminate the workers themselves.
 

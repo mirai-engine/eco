@@ -297,6 +297,19 @@ int eco_check_private_dir(const char *name) {
     return ok;
 }
 
+int eco_ensure_private_dir(const char *name) {
+    if (eco_check_private_dir(name)) return 1;
+    wchar_t *wide = eco_wide(name);
+    if (!wide) return 0;
+    SECURITY_ATTRIBUTES security;
+    PSECURITY_DESCRIPTOR descriptor;
+    if (eco_pipe_security(&security, &descriptor) < 0) { free(wide); return 0; }
+    CreateDirectoryW(wide, &security);
+    LocalFree(descriptor);
+    free(wide);
+    return eco_check_private_dir(name);
+}
+
 int eco_lock_local(const char *name) {
     wchar_t *wide = eco_wide(name);
     if (!wide) return -1;
