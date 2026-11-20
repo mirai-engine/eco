@@ -55,7 +55,7 @@ def main():
         clients.write_text(client_key + "\n")
         target = endpoint(port_for())
         path = base / "s"
-        env = {**os.environ, "ECO_ODIN_SOCKET": str(path)}
+        env = {**os.environ, "ECO_SOCKET": str(path)}
         with background("serve", target, server_secret, clients, base, "run") as server:
             assert b"listening" in server.stderr.readline()
             time.sleep(0.2)

@@ -267,7 +267,7 @@ allow_command :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call) -> b
         error = "persistent jobs are disabled" if job else "execution is disabled"
     } else if job {
         if server.jobs == "" {
-            error = "background job storage is not configured. Set ECO_ODIN_JOBS on the server."
+            error = "background job storage is not configured. Set ECO_JOBS on the server."
         } else if stream.link.confined && eco_scope_supported() != 1 {
             error = "OS cannot enforce the execution scope"
         }
@@ -638,7 +638,7 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
     defer _ = eco_close(udp_fd)
     if eco_fd_setup(udp_fd, 1) < 0 { return error_exit("cannot configure UDP socket") }
     server := Server{udp = udp, own = own^, clients = clients, root = fd, access = access, policy = policy, root_path = root, jobs = jobs}
-    if path := os.get_env("ECO_ODIN_DESKTOP_SOCKET", context.temp_allocator); path != "" {
+    if path := os.get_env("ECO_DESKTOP_SOCKET", context.temp_allocator); path != "" {
         if !valid_local_path(path) { return error_exit("invalid or non-private desktop IPC endpoint") }
         server.desktop_socket = strings.clone_to_cstring(path)
     }

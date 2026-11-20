@@ -143,9 +143,9 @@ def main():
         (base/"eco-clients").write_text(client_key + "\n")
         local = base/"eco.sock"
         target = endpoint(port_for())
-        env = {**os.environ, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_ADDR": target,
-               "ECO_ODIN_KEY": str(base/"eco-client"), "ECO_ODIN_PEER": server_key}
-        tcp_env = {**env, "ECO_ODIN_BULK_TCP": "1"}
+        env = {**os.environ, "ECO_SOCKET": str(local), "ECO_ADDR": target,
+               "ECO_KEY": str(base/"eco-client"), "ECO_PEER": server_key}
+        tcp_env = {**env, "ECO_BULK_TCP": "1"}
         server = stack.enter_context(background("serve", target, base/"eco-server", base/"eco-clients", base, "run", env=tcp_env))
         assert b"listening" in server.stderr.readline()
         client = stack.enter_context(background("client", local, target, base/"eco-client", server_key, env=env))

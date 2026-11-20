@@ -68,7 +68,7 @@ clear_bulk :: proc(b: ^Bulk_Server) {
 
 bulk_enabled :: proc() -> bool {
     value: [64]byte
-    return os.get_env(value[:], "ECO_ODIN_BULK_TCP") == "1"
+    return os.get_env(value[:], "ECO_BULK_TCP") == "1"
 }
 
 bulk_length :: proc(header: []byte) -> int {
@@ -326,17 +326,17 @@ poll_bulk :: proc(b: ^Bulk_Server, server: ^Server, fds, events: []c.int, count:
 
 bulk_client :: proc(op: Op, remote, local: string) -> int {
     if len(remote) == 0 || len(remote) >= MESSAGE_MAX { return error_exit("invalid remote path") }
-    target := os.get_env("ECO_ODIN_ADDR", context.temp_allocator)
-    key := os.get_env("ECO_ODIN_KEY", context.temp_allocator)
+    target := os.get_env("ECO_ADDR", context.temp_allocator)
+    key := os.get_env("ECO_KEY", context.temp_allocator)
     peer_text := client_peer(target)
     endpoint, ok := net.parse_endpoint(target)
-    if !ok || endpoint.port <= 0 { return error_exit("bulk TCP requires ECO_ODIN_ADDR") }
+    if !ok || endpoint.port <= 0 { return error_exit("bulk TCP requires ECO_ADDR") }
     own: ecdh.Private_Key
     peer: ecdh.Public_Key
     defer ecdh.private_key_clear(&own)
     if !load_keys(key, peer_text, &own, &peer) { return error_exit("invalid bulk TCP identity") }
     token: []byte
-    if encoded := os.get_env("ECO_ODIN_CAPABILITY", context.temp_allocator); encoded != "" {
+    if encoded := os.get_env("ECO_CAPABILITY", context.temp_allocator); encoded != "" {
         if len(encoded) > CAP_MAX*2 { return error_exit("invalid capability") }
         token, ok = hex.decode(transmute([]byte)encoded, context.temp_allocator)
         if !ok { return error_exit("invalid capability") }

@@ -343,7 +343,7 @@ job_worker :: proc(path, root, expiry_text: string, confined: bool) -> int {
             if data_len == 0 { close_fd(&source); continue }
             if data_len == -2 { continue }
             if data_len < 0 || counts[i]+int(data_len) > JOB_OUTPUT_MAX {
-                _, _ = os.write_string(outputs[1], "eco-odin: job output limit or read error\n")
+                _, _ = os.write_string(outputs[1], "eco: job output limit or read error\n")
                 return 125
             }
             written, err := os.write(outputs[i], bytes[:data_len])

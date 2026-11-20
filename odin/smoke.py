@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 
-BINARY = Path(__file__).resolve().parent.parent / "bin" / "eco-odin"
+BINARY = Path(__file__).resolve().parent.parent / "bin" / "eco"
 
 
 def cli(*args, env=None, data=None, timeout=12, check=True):
@@ -76,11 +76,11 @@ def main():
             port = reserve.getsockname()[1]
         address = f"127.0.0.1:{port}"
         local_socket = base / "s"
-        env = {**os.environ, "ECO_ODIN_SOCKET": str(local_socket)}
+        env = {**os.environ, "ECO_SOCKET": str(local_socket)}
 
         with background("serve", address, server_secret, clients, root, "run",
-                        env={**env, "ECO_ODIN_JOBS": ""}) as server:
-            assert server.stderr.readline().startswith(b"eco-odin listening")
+                        env={**env, "ECO_JOBS": ""}) as server:
+            assert server.stderr.readline().startswith(b"eco listening")
             assert cli("ping-early", address, client_secret, server_key).stdout.startswith(b"pong")
             stranger = keys / "stranger"
             cli("keygen", stranger)
@@ -132,7 +132,7 @@ def main():
                 ]:
                     rejected = cli(*args, env=env, check=False)
                     assert rejected.returncode and b"background job storage is not configured" in rejected.stderr, rejected
-                    assert b"ECO_ODIN_JOBS" in rejected.stderr, rejected
+                    assert b"ECO_JOBS" in rejected.stderr, rejected
 
                 with socket.socket(socket.AF_UNIX) as local:
                     local.settimeout(4)
@@ -187,7 +187,7 @@ def main():
                     assert failure[0] == 38 and b"BLAKE3" in failure
                 assert (root / "fixture").read_bytes() == content
                 assert not list(root.glob(".eco-part-*"))
-    print("ECO Odin loopback integration passed")
+    print("ECO loopback integration passed")
 
 
 if __name__ == "__main__":

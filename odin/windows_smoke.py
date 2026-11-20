@@ -200,9 +200,9 @@ def check_pairing(binary, base, run, root):
         reserve.bind(("127.0.0.1", 0))
         address = f"127.0.0.1:{reserve.getsockname()[1]}"
     clients = base / "pair-clients"
-    env = {**os.environ, "ECO_ODIN_HOME": str(home), "ECO_ODIN_KEY": str(client_key),
-           "ECO_ODIN_ADDR": address, "ECO_ODIN_SOCKET": r"\\.\pipe\eco-win-pair-" + uuid.uuid4().hex}
-    for name in ("ECO_ODIN_PEER", "ECO_ODIN_CAPABILITY", "ECO_ODIN_BULK_TCP"):
+    env = {**os.environ, "ECO_HOME": str(home), "ECO_KEY": str(client_key),
+           "ECO_ADDR": address, "ECO_SOCKET": r"\\.\pipe\eco-win-pair-" + uuid.uuid4().hex}
+    for name in ("ECO_PEER", "ECO_CAPABILITY", "ECO_BULK_TCP"):
         env.pop(name, None)
     server = subprocess.Popen([binary, "serve", address, server_key, clients, root, "read"],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -244,7 +244,7 @@ def check_pairing(binary, base, run, root):
         assert (home / "known_servers").read_text().split() == [address, server_public]
         assert run("ping", env=env).stdout.startswith(b"pong")
         assert run("stat", ".", env=env).stdout.startswith(b"directory")
-        stop_test_daemon(env["ECO_ODIN_SOCKET"])
+        stop_test_daemon(env["ECO_SOCKET"])
         clients.write_text("")  # Revocation applies to the next handshake.
         assert run("ping-early", address, client_key, server_public, env=env, checked=False).returncode != 0
     finally:
@@ -257,7 +257,7 @@ def main():
         raise SystemExit("This smoke test requires Windows.")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
-                        default=Path(__file__).resolve().parents[1] / "bin/eco-windows-amd64.exe")
+                        default=Path(__file__).resolve().parents[1] / "bin/eco.exe")
     binary = parser.parse_args().binary.resolve()
 
     def run(*args, env=None, data=None, checked=True):
@@ -306,12 +306,12 @@ def main():
             port = reserve.getsockname()[1]
         address = f"127.0.0.1:{port}"
         pipe = r"\\.\pipe\eco-win-test-" + uuid.uuid4().hex
-        env = {**os.environ, "ECO_ODIN_SOCKET": pipe, "ECO_ODIN_ADDR": address,
-               "ECO_ODIN_KEY": str(client_key), "ECO_ODIN_PEER": server_public,
-               "ECO_ODIN_JOBS": str(jobs)}
-        env.pop("ECO_ODIN_CAPABILITY", None)
-        env.pop("ECO_ODIN_BULK_TCP", None)
-        bulk = {**env, "ECO_ODIN_BULK_TCP": "1"}
+        env = {**os.environ, "ECO_SOCKET": pipe, "ECO_ADDR": address,
+               "ECO_KEY": str(client_key), "ECO_PEER": server_public,
+               "ECO_JOBS": str(jobs)}
+        env.pop("ECO_CAPABILITY", None)
+        env.pop("ECO_BULK_TCP", None)
+        bulk = {**env, "ECO_BULK_TCP": "1"}
         clients = base / "clients"
         clients.write_text(client_public + " smoke\n")
         server_args = ("serve", address, server_key, clients, root, "run")
@@ -396,10 +396,10 @@ def main():
 
         # Verify the CLI can start its own daemon under the same user's security descriptor.
         # A unique pipe name avoids touching an existing daemon.
-        auto_env = {**env, "ECO_ODIN_SOCKET": pipe + "-auto"}
+        auto_env = {**env, "ECO_SOCKET": pipe + "-auto"}
         with background(*server_args, directory=base, env=bulk):
             assert run("ping", env=auto_env).stdout.startswith(b"pong")
-            stop_test_daemon(auto_env["ECO_ODIN_SOCKET"])
+            stop_test_daemon(auto_env["ECO_SOCKET"])
 
         check_pairing(binary, base, run, root)
 

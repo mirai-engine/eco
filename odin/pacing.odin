@@ -25,7 +25,7 @@ configured_bulk_limit: int = 10_000
 
 load_bulk_limit :: proc() {
     env: [32]byte
-    value := os.get_env(env[:], "ECO_ODIN_BULK_MBPS")
+    value := os.get_env(env[:], "ECO_BULK_MBPS")
     configured_bulk_limit = 10_000
     if value != "" {
         if mbps, ok := strconv.parse_int(value, 10); ok && mbps >= 1 && mbps <= 100_000 {

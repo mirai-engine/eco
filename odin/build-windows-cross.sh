@@ -26,5 +26,5 @@ int _fltused = 0x9875;
 #pragma comment(linker, "/alternatename:__chkstk=___chkstk_ms")
 SRC
 "$compiler" -fms-extensions -c "$target/cross_crt.c" -o "$target/cross_crt.obj"
-"$compiler" -Wl,--subsystem,console -o bin/eco-windows-amd64.exe "$target/eco.obj" \
+"$compiler" -Wl,--subsystem,console -o bin/eco.exe "$target/eco.obj" \
     "$target/cross_crt.obj" "$target/eco_platform.lib" -lws2_32 -ladvapi32 -lbcrypt -liphlpapi -luserenv -lole32 -lntdll

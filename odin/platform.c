@@ -49,11 +49,11 @@ void eco_install_signals(void) {
 int eco_stopping(void) { return stopping; }
 
 void eco_listening(int port) {
-    fprintf(stderr, "eco-odin listening on UDP %d\n", port);
+    fprintf(stderr, "eco listening on UDP %d\n", port);
 }
 
 void eco_ring_ready(void) {
-    fputs("eco-odin io_uring ready\n", stderr);
+    fputs("eco io_uring ready\n", stderr);
 }
 
 int eco_wait(int fd, int timeout) {
@@ -343,7 +343,7 @@ static int open_pipe(int fds[2]) {
 }
 
 static void scope_failed(void) {
-    static const char message[] = "eco-odin: cannot start sandboxed command\n";
+    static const char message[] = "eco: cannot start sandboxed command\n";
     ssize_t ignored = write(STDERR_FILENO, message, sizeof(message) - 1);
     (void)ignored;
     _exit(126);

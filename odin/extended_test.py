@@ -247,7 +247,7 @@ def test_stream_liveness(base, root, server_port, client_secret, server_key, env
 
             proxy = stack.enter_context(Fault_Proxy(server_port, forward_response))
             local = base / name
-            settings = {**env, "ECO_ODIN_SOCKET": str(local)}
+            settings = {**env, "ECO_SOCKET": str(local)}
             client = stack.enter_context(
                 background("client", local, endpoint(proxy.port), client_secret, server_key, env=settings)
             )
@@ -276,7 +276,7 @@ def test_stream_liveness(base, root, server_port, client_secret, server_key, env
 
 def test_faults(base, server_port, client_secret, server_key, env):
     local = base / "faults"
-    env = {**env, "ECO_ODIN_SOCKET": str(local)}
+    env = {**env, "ECO_SOCKET": str(local)}
     original, cloned = base / "fault-source", base / "fault-result"
     payload = os.urandom(512 * 1024)
     original.write_bytes(payload)
@@ -313,9 +313,9 @@ def test_capabilities(base, root, server_secret, server_key, client_secret, clie
         assert b"listening" in server.stderr.readline()
         wrong = capability[:-1] + ("a" if capability[-1] != "a" else "b")
         assert cli("ping-early", endpoint(port), client_secret, server_key,
-                   env={**env, "ECO_ODIN_CAPABILITY": wrong}, check=False).returncode
+                   env={**env, "ECO_CAPABILITY": wrong}, check=False).returncode
         local = base / "cap"
-        env = {**env, "ECO_ODIN_CAPABILITY": capability, "ECO_ODIN_SOCKET": str(local)}
+        env = {**env, "ECO_CAPABILITY": capability, "ECO_SOCKET": str(local)}
         with background("client", local, endpoint(port), client_secret, server_key, env=env) as client:
             wait_ready(local, client)
             assert cli("read", "inside", env=env).stdout == b"allowed"
@@ -330,11 +330,11 @@ def test_capabilities(base, root, server_secret, server_key, client_secret, clie
     scope_grant = cli("grant", key_path, server_key, client_key, "rx", "60", "scope").stdout.decode().strip()
     with background("serve", endpoint(port), server_secret, base / "clients", root, "run", issuer, env=env) as server:
         assert b"listening" in server.stderr.readline()
-        if sys.platform == "linux" and env.get("ECO_ODIN_IO_URING") == "1":
+        if sys.platform == "linux" and env.get("ECO_IO_URING") == "1":
             assert select.select([server.stderr], [], [], 2)[0], "io_uring not reported by server"
             assert b"io_uring ready" in server.stderr.readline()
         local = base / "restricted"
-        scoped = {**env, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_CAPABILITY": scope_grant}
+        scoped = {**env, "ECO_SOCKET": str(local), "ECO_CAPABILITY": scope_grant}
         with background("client", local, endpoint(port), client_secret, server_key, env=scoped) as client:
             wait_ready(local, client)
             operation = cli("run", "--", "/bin/sh", "-c", "printf built > generated; cat generated", env=scoped, check=False)
@@ -362,8 +362,8 @@ def test_capabilities(base, root, server_secret, server_key, client_secret, clie
 def test_bulk(base, root, server_secret, server_key, client_secret, client_key, env):
     port = port_for(socket.SOCK_STREAM)
     target = endpoint(port)
-    settings = {**env, "ECO_ODIN_BULK_TCP": "1", "ECO_ODIN_ADDR": target,
-                "ECO_ODIN_KEY": str(client_secret), "ECO_ODIN_PEER": server_key}
+    settings = {**env, "ECO_BULK_TCP": "1", "ECO_ADDR": target,
+                "ECO_KEY": str(client_secret), "ECO_PEER": server_key}
     source, result = base / "bulk-source", base / "bulk-result"
     data = os.urandom(3 * 1024 * 1024)
     source.write_bytes(data)
@@ -381,10 +381,10 @@ def test_bulk(base, root, server_secret, server_key, client_secret, client_key, 
         assert not (root.parent / "outside").exists()
         wrong_client = base / "other-client"
         cli("keygen", wrong_client)
-        wrong = {**settings, "ECO_ODIN_KEY": str(wrong_client)}
+        wrong = {**settings, "ECO_KEY": str(wrong_client)}
         assert cli("put", source, "wrong", env=wrong, check=False).returncode
         assert not (root / "wrong").exists()
-    portable = {**settings, "ECO_ODIN_BULK_CRYPTO": "portable"}
+    portable = {**settings, "ECO_BULK_CRYPTO": "portable"}
     with background("serve", target, server_secret, base / "clients", root, "read", env=portable) as server:
         ready = server.stderr.readline()
         assert b"listening" in ready, ready
@@ -408,7 +408,7 @@ def test_jobs(stack, base, root, port, server_secret, client_secret, server_key,
         new_client = base / "second"
         client = new_stack.enter_context(background("client", new_client, endpoint(port), client_secret, server_key))
         wait_ready(new_client, client)
-        env = {**env, "ECO_ODIN_SOCKET": str(new_client)}
+        env = {**env, "ECO_SOCKET": str(new_client)}
         result = cli("attach", job, "3", "0", env=env, check=False)
         assert (result.returncode, result.stdout, result.stderr) == (7, b"two", b"err"), result
         running = cli("start", "--", "/bin/sleep", "20", env=env).stdout.decode().strip()
@@ -416,10 +416,10 @@ def test_jobs(stack, base, root, port, server_secret, client_secret, server_key,
         assert cli("attach", running, env=env, check=False).returncode == 130
 
     default_home = base / "default-home"
-    default_env = {k: v for k, v in env.items() if k != "ECO_ODIN_JOBS"}
-    default_env["ECO_ODIN_HOME"] = str(default_home)
+    default_env = {k: v for k, v in env.items() if k != "ECO_JOBS"}
+    default_env["ECO_HOME"] = str(default_home)
     default_port, default_local = port_for(), base / "s-default"
-    default_env["ECO_ODIN_SOCKET"] = str(default_local)
+    default_env["ECO_SOCKET"] = str(default_local)
     with ExitStack() as default_stack:
         s = default_stack.enter_context(background("serve", endpoint(default_port), server_secret, base / "clients", root, "run", env=default_env))
         assert b"listening" in s.stderr.readline()
@@ -443,7 +443,7 @@ def main():
         client_key = cli("keygen", client_secret).stdout.decode().strip()
         (base / "clients").write_text(client_key + "\n")
         port, local = port_for(), base / "s"
-        env = {**os.environ, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_JOBS": str(jobs), "TEST_ROOT": str(root)}
+        env = {**os.environ, "ECO_SOCKET": str(local), "ECO_JOBS": str(jobs), "TEST_ROOT": str(root)}
         with ExitStack() as stack:
             server = stack.enter_context(background("serve", endpoint(port), server_secret, base / "clients", root, "run", env=env))
             assert b"listening" in server.stderr.readline()

@@ -61,4 +61,4 @@ if [ "${1:-}" = test ]; then
     shift
     exec "${ODIN:-odin}" test odin "$lock_flags" ${link_flags:+"$link_flags"} "$@"
 fi
-exec "${ODIN:-odin}" build odin "$lock_flags" ${link_flags:+"$link_flags"} -o:speed -out:bin/eco-odin "$@"
+exec "${ODIN:-odin}" build odin "$lock_flags" ${link_flags:+"$link_flags"} -o:speed -out:bin/eco "$@"

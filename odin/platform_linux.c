@@ -148,7 +148,7 @@ static int enable_ring(void) {
 }
 
 int eco_ring_setup(void) {
-    const char *configured = getenv("ECO_ODIN_IO_URING");
+    const char *configured = getenv("ECO_IO_URING");
     if (configured && strcmp(configured, "0") == 0) ring_preference = -1;
     if (configured && strcmp(configured, "1") == 0) ring_preference = 1;
     return ring_preference == 1 && enable_ring();

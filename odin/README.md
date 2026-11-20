@@ -16,15 +16,15 @@ AES-GCM acceleration.
 
 macOS uses poll for small descriptor sets and kqueue as they grow. Linux uses the same small-set
 poll path and can use io_uring for larger sets when the kernel permits it. Set
-`ECO_ODIN_IO_URING=1` to exercise the ring even for small sets. With that override the server logs
-`eco-odin io_uring ready` after initializing the ring. Set `ECO_ODIN_IO_URING=0` to use poll only.
+`ECO_IO_URING=1` to exercise the ring even for small sets. With that override the server logs
+`eco io_uring ready` after initializing the ring. Set `ECO_IO_URING=0` to use poll only.
 
 The Odin daemon uses Noise, binary framing and pinned keys.
 
 ```sh
 ./odin/build.sh
-bin/eco-odin keygen server.key  # run on the server machine
-bin/eco-odin keygen client.key  # run on the client machine
+bin/eco keygen server.key  # run on the server machine
+bin/eco keygen client.key  # run on the client machine
 ```
 
 Leave the private files on their respective machines. The server accepts the clients listed in a
@@ -34,15 +34,15 @@ without copying keys:
 
 ```sh
 # Server, with native read/write, command execution, PTY and forwarding enabled
-mkdir -m 700 "$HOME/.eco-odin-jobs"
-ECO_ODIN_JOBS="$HOME/.eco-odin-jobs" \
-  bin/eco-odin serve 192.0.2.10:8443 server.key clients /path/to/repo run
+mkdir -m 700 "$HOME/.eco-jobs"
+ECO_JOBS="$HOME/.eco-jobs" \
+  bin/eco serve 192.0.2.10:8443 server.key clients /path/to/repo run
 
 # Client
-export ECO_ODIN_ADDR=192.0.2.10:8443
-export ECO_ODIN_KEY="$PWD/client.key"
-bin/eco-odin pair "$ECO_ODIN_ADDR" laptop
-bin/eco-odin ping
+export ECO_ADDR=192.0.2.10:8443
+export ECO_KEY="$PWD/client.key"
+bin/eco pair "$ECO_ADDR" laptop
+bin/eco ping
 ```
 
 Both screens show the same verification code, for example `0346-9283`. It is derived from the
@@ -51,16 +51,16 @@ makes the two codes differ. A running server always accepts requests and asks it
 Windows and macOS a dialog in the operator's session shows the client's name, address and code,
 with No as the default; on Linux the server's terminal asks `y` or `n`. A request expires after
 five minutes. On approval the server appends the client to `CLIENTS` and the client stores the
-server key under its address in `ECO_ODIN_HOME/known_servers` (`~/.eco-odin` by default), which
-later commands use for that `ECO_ODIN_ADDR`; `ECO_ODIN_PEER` pins a key instead.
+server key under its address in `ECO_HOME/known_servers` (`~/.eco` by default), which
+later commands use for that `ECO_ADDR`; `ECO_PEER` pins a key instead.
 
 Any machine that reaches the port can raise a request, so approve only one you expect and whose
 code matches. The server handles one request at a time and, after five denied or expired requests
 in a row, ignores new ones for ten minutes. The code has 8 digits.
 
 The client starts its daemon on demand and exits it after two minutes without local calls.
-Alternatively, run `eco-odin client SOCKET UDP KEY PEER` in the foreground. Use a separate
-`ECO_ODIN_SOCKET` in an owner-only directory for each distinct server, identity or capability.
+Alternatively, run `eco client SOCKET UDP KEY PEER` in the foreground. Use a separate
+`ECO_SOCKET` in an owner-only directory for each distinct server, identity or capability.
 An existing daemon keeps its original settings until it exits.
 
 For reusable local queries, connect directly to that Unix socket. Each frame starts with a
@@ -74,24 +74,24 @@ authenticated request/reply record, with retries for loss, for these read-only o
 ## Operations
 
 ```sh
-eco-odin stat path
-eco-odin list .
-eco-odin watch path
-eco-odin hash path
-eco-odin read path
-eco-odin put ./local.bin target.bin
-eco-odin get target.bin ./verified.bin
-eco-odin run --cwd subdir -- git status --short
-eco-odin run --stdin -- /usr/bin/cat
-eco-odin tty -- /bin/sh
-eco-odin forward 127.0.0.1:8765 127.0.0.1:8765
-eco-odin forward-udp 127.0.0.1:5354 127.0.0.1:5353
+eco stat path
+eco list .
+eco watch path
+eco hash path
+eco read path
+eco put ./local.bin target.bin
+eco get target.bin ./verified.bin
+eco run --cwd subdir -- git status --short
+eco run --stdin -- /usr/bin/cat
+eco tty -- /bin/sh
+eco forward 127.0.0.1:8765 127.0.0.1:8765
+eco forward-udp 127.0.0.1:5354 127.0.0.1:5353
 
-job=$(eco-odin start -- /usr/bin/make)
-eco-odin jobs
-eco-odin attach "$job"
-eco-odin attach "$job" 128 0  # resume at these stdout and stderr byte offsets
-eco-odin kill "$job"
+job=$(eco start -- /usr/bin/make)
+eco jobs
+eco attach "$job"
+eco attach "$job" 128 0  # resume at these stdout and stderr byte offsets
+eco kill "$job"
 ```
 
 `run`, `tty` and `start` accept command arguments and a working directory totaling up to
@@ -107,13 +107,13 @@ directory descriptors and reject symlink traversal. Uploads are verified before 
 Downloads verify their whole BLAKE3 digest before replacing the local destination. `watch` samples
 metadata every 250 ms and detects changes visible at the sampling boundary.
 
-Set `ECO_ODIN_BULK_TCP=1` on both machines to send `put` and `get` over a separate TCP listener
-on the same numeric port. The bulk client uses `ECO_ODIN_ADDR`, `ECO_ODIN_KEY`, `ECO_ODIN_PEER`
-and, when required, `ECO_ODIN_CAPABILITY`. The Noise IK handshake uses a distinct prologue, and
+Set `ECO_BULK_TCP=1` on both machines to send `put` and `get` over a separate TCP listener
+on the same numeric port. The bulk client uses `ECO_ADDR`, `ECO_KEY`, `ECO_PEER`
+and, when required, `ECO_CAPABILITY`. The Noise IK handshake uses a distinct prologue, and
 a transport-encrypted confirmation carries fresh keying material. HKDF-SHA256 binds it to the
 Noise transcript, and separate AES-256-GCM keys authenticate the two record directions. The
 server starts a transfer worker only after it verifies that confirmation. Libcrypto loads on
-demand when available. `ECO_ODIN_BULK_CRYPTO=portable` selects the wire-compatible Odin AES
+demand when available. `ECO_BULK_CRYPTO=portable` selects the wire-compatible Odin AES
 implementation. Each bulk connection is bounded to 2²² records per direction.
 
 The remote target of a forward is a numeric IP and port as seen by the server. TCP forwarding
@@ -124,8 +124,8 @@ queue per sender.
 `start --id HEX` accepts a 32-character idempotency key. A detached worker owns the process and
 spools stdout, stderr and the exit status to disk. `attach` works across server and client daemon
 restarts. A worker that exits without publishing a result leaves an indeterminate job and the server
-does not rerun it. When `serve ... run` starts without `ECO_ODIN_JOBS` set, Eco uses a private
-`ECO_ODIN_HOME/jobs` directory automatically; set `ECO_ODIN_JOBS=` (empty) to disable background jobs.
+does not rerun it. When `serve ... run` starts without `ECO_JOBS` set, Eco uses a private
+`ECO_HOME/jobs` directory automatically; set `ECO_JOBS=` (empty) to disable background jobs.
 Jobs retain at most 64 MiB per output stream and remain on disk until the operator removes them.
 A machine reboot can terminate the workers themselves.
 
@@ -133,8 +133,8 @@ A machine reboot can terminate the workers themselves.
 
 First-party tools use the ECO CLI or binary IPC for native operations. To try a third-party ACP
 agent or MCP server over stdio, configure its client to launch
-`eco-odin run --stdin -- PROGRAM ARGS...`. The two ends still speak their original protocol.
-For a third-party MCP server using Streamable HTTP, use `eco-odin forward` and point the MCP client
+`eco run --stdin -- PROGRAM ARGS...`. The two ends still speak their original protocol.
+For a third-party MCP server using Streamable HTTP, use `eco forward` and point the MCP client
 at the local endpoint.
 
 ## Desktop control
@@ -153,17 +153,17 @@ macOS controls Screen Recording and Accessibility. Enable both for the helper or
 as indicated by macOS, then relaunch the helper if prompted. Start the ECO server in its own shell.
 
 ```sh
-ECO_ODIN_DESKTOP_SOCKET="$HOME/.eco-desktop/helper.sock" \
-  bin/eco-odin serve SERVER_IP:8443 server.key clients /path/to/repo run
+ECO_DESKTOP_SOCKET="$HOME/.eco-desktop/helper.sock" \
+  bin/eco serve SERVER_IP:8443 server.key clients /path/to/repo run
 ```
 
 After [pairing](#build-and-pair), use the normal client CLI on the controlling machine.
 
 ```sh
-bin/eco-odin desktop capture > screen.jpg
-bin/eco-odin desktop click 150 80
-bin/eco-odin desktop type 'Hello'
-bin/eco-odin desktop stream 4 | ffplay -f mjpeg -i -
+bin/eco desktop capture > screen.jpg
+bin/eco desktop click 150 80
+bin/eco desktop type 'Hello'
+bin/eco desktop stream 4 | ffplay -f mjpeg -i -
 ```
 
 `move X Y` and `click X Y [left|right]` use pixels in the returned image, with origin at the
@@ -194,10 +194,10 @@ full access. Add an Ed25519 issuer public key as the last argument to require a 
 addition to the pinned client identity.
 
 ```sh
-eco-odin issuer-keygen issuer.key  # keep this file on the granting machine
-eco-odin grant issuer.key SERVER_PUBLIC CLIENT_PUBLIC r 3600 subdir
+eco issuer-keygen issuer.key  # keep this file on the granting machine
+eco grant issuer.key SERVER_PUBLIC CLIENT_PUBLIC r 3600 subdir
 # Add ISSUER_PUBLIC after the server access mode. On the client:
-export ECO_ODIN_CAPABILITY=SIGNED_GRANT_FROM_PREVIOUS_COMMAND
+export ECO_CAPABILITY=SIGNED_GRANT_FROM_PREVIOUS_COMMAND
 ```
 
 A grant binds the server and client identities, expiry, operations and directory. The letters are
@@ -224,7 +224,7 @@ respect the grant expiry. The job namespace binds to the client identity and gra
   challenge-response verifies a new return path before changing the session endpoint.
 - Each active stream uses KCP for selective retransmission and flow control. Congestion windows
   are per stream. A shared byte budget paces large UDP file records across streams. Set
-  `ECO_ODIN_BULK_MBPS` on each sending daemon to match the available rate in megabits per second.
+  `ECO_BULK_MBPS` on each sending daemon to match the available rate in megabits per second.
   The default budget is 10,000 Mbps. Control and acknowledgment records can pass queued file data.
 - Clients open a fresh session for new calls before the 15-minute limit on opening streams.
   Existing streams finish on their original session, subject to inactivity and signed grant
@@ -255,16 +255,16 @@ Cross-compile on macOS or Linux with a matching LLVM-MinGW UCRT toolchain.
 ./odin/build-windows-cross.sh /absolute/path/to/llvm-mingw/bin
 ```
 
-Both builds produce `bin/eco-windows-amd64.exe`. On Windows, the default IPC endpoint is
-`\\.\pipe\eco-odin-<current-user-SID>`. For a second daemon, set `ECO_ODIN_SOCKET` to a
-different local pipe name, such as `\\.\pipe\eco-odin-work`. Set `ECO_ODIN_ADDR` and
-`ECO_ODIN_KEY`, and pair, as on Unix. Key generation creates a private ACL.
+Both builds produce `bin/eco.exe`. On Windows, the default IPC endpoint is
+`\\.\pipe\eco-<current-user-SID>`. For a second daemon, set `ECO_SOCKET` to a
+different local pipe name, such as `\\.\pipe\eco-work`. Set `ECO_ADDR` and
+`ECO_KEY`, and pair, as on Unix. Key generation creates a private ACL.
 The job directory must be on NTFS and owned by the launching user with an ACL scoped to
 that user and trusted system administrators.
 
 ```powershell
-.\bin\eco-windows-amd64.exe run -- cmd.exe /d /c ver
-.\bin\eco-windows-amd64.exe tty -- powershell.exe -NoLogo
+.\bin\eco.exe run -- cmd.exe /d /c ver
+.\bin\eco.exe tty -- powershell.exe -NoLogo
 ```
 
 The Windows smoke suite runs on a native host. It exercises identity, IOCP IPC, binary I/O,

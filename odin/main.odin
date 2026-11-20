@@ -13,11 +13,11 @@ import "core:strings"
 import "core:time"
 import "deps:blake3"
 
-USAGE :: `usage: eco-odin COMMAND
+USAGE :: `usage: eco COMMAND
   keygen KEY                         create a 0600 X25519 key and print its public key
   serve UDP KEY CLIENTS ROOT [read|write|run|tunnel] [ISSUER_PUBLIC_KEY]
                                      CLIENTS lists authorized client keys; approved pairings add to it
-  pair UDP [NAME]                    pair with a server using ECO_ODIN_KEY; its operator approves
+  pair UDP [NAME]                    pair with a server using ECO_KEY; its operator approves
   issuer-keygen KEY
   grant ISSUER_KEY SERVER_KEY CLIENT_KEY RWXT TTL_SECONDS PATH
   client SOCKET UDP KEY PEER         keep a client daemon in the foreground
@@ -36,23 +36,23 @@ USAGE :: `usage: eco-odin COMMAND
   forward|forward-udp LISTEN TARGET
   tty [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
 
-Client environment: ECO_ODIN_SOCKET, ECO_ODIN_ADDR, ECO_ODIN_KEY, ECO_ODIN_HOME and, unless pair
-stored the server for ECO_ODIN_ADDR in ECO_ODIN_HOME/known_servers, ECO_ODIN_PEER.
+Client environment: ECO_SOCKET, ECO_ADDR, ECO_KEY, ECO_HOME and, unless pair
+stored the server for ECO_ADDR in ECO_HOME/known_servers, ECO_PEER.
 Paths sent to the server are relative to ROOT. Peer keys are 64 hex characters.
 `
 
 error_exit :: proc(message: string, detail: any = nil) -> int {
     if detail == nil {
-        fmt.eprintln("eco-odin:", message)
+        fmt.eprintln("eco:", message)
     } else {
-        fmt.eprintln("eco-odin:", message, detail)
+        fmt.eprintln("eco:", message, detail)
     }
     return 125
 }
 
 process_exit :: proc(code: u32) -> int {
     if code > 255 {
-        fmt.eprintfln("eco-odin: remote process exited with status 0x%08X", code)
+        fmt.eprintfln("eco: remote process exited with status 0x%08X", code)
         when ODIN_OS != .Windows { return 125 }
     }
     return int(code)
@@ -102,7 +102,7 @@ dispatch_platform :: proc(args: []string) -> int {
     }
     token: []byte
     if role != "serve" {
-        if encoded := os.get_env("ECO_ODIN_CAPABILITY", context.temp_allocator); encoded != "" {
+        if encoded := os.get_env("ECO_CAPABILITY", context.temp_allocator); encoded != "" {
             valid: bool
             if len(encoded) > CAP_MAX*2 { return error_exit("invalid capability") }
             token, valid = hex.decode(transmute([]byte)encoded, context.temp_allocator)
@@ -130,7 +130,7 @@ dispatch_platform :: proc(args: []string) -> int {
             policy.required = true
             ecdh.private_key_public_bytes(&own, policy.server_key[:])
         }
-        jobs, jobs_set := os.lookup_env("ECO_ODIN_JOBS", context.temp_allocator)
+        jobs, jobs_set := os.lookup_env("ECO_JOBS", context.temp_allocator)
         if !jobs_set && access == .Run {
             if home := eco_home(); home != "" && os.is_absolute_path(home) {
                 candidate := fmt.tprintf("%s/jobs", home)
@@ -140,7 +140,7 @@ dispatch_platform :: proc(args: []string) -> int {
         } else if jobs != "" {
             name := strings.clone_to_cstring(jobs, context.temp_allocator)
             if !(os.is_absolute_path(jobs)) || eco_check_private_dir(name) != 1 {
-                return error_exit("ECO_ODIN_JOBS must be an absolute, private directory owned by you")
+                return error_exit("ECO_JOBS must be an absolute, private directory owned by you")
             }
         }
         return serve(endpoint, &own, args[3], args[4], access, policy, jobs)
@@ -167,7 +167,7 @@ dispatch_platform :: proc(args: []string) -> int {
 
 dial_local :: proc() -> c.int {
     sock_buffer: [1024]byte
-    path := os.get_env(sock_buffer[:], "ECO_ODIN_SOCKET")
+    path := os.get_env(sock_buffer[:], "ECO_SOCKET")
     when ODIN_OS == .Windows {
         if path == "" { path = default_pipe_name() }
     }
@@ -181,8 +181,8 @@ dial_local :: proc() -> c.int {
     fd := eco_connect_local(name)
     if fd >= 0 { return fd }
 
-    address := os.get_env("ECO_ODIN_ADDR", context.temp_allocator)
-    key := os.get_env("ECO_ODIN_KEY", context.temp_allocator)
+    address := os.get_env("ECO_ADDR", context.temp_allocator)
+    key := os.get_env("ECO_KEY", context.temp_allocator)
     peer := client_peer(address)
     if address == "" || key == "" || peer == "" { return -1 }
     executable, err := os.get_executable_path(context.temp_allocator)
@@ -384,7 +384,7 @@ command_cli :: proc(args: []string) -> int {
         payload = transmute([]byte)path
     }
     fd := dial_local()
-    if fd < 0 { return error_exit("client unavailable; set ECO_ODIN_ADDR and ECO_ODIN_KEY, and pair with the server or set ECO_ODIN_PEER") }
+    if fd < 0 { return error_exit("client unavailable; set ECO_ADDR and ECO_KEY, and pair with the server or set ECO_PEER") }
     defer close_fd(&fd)
 
     input := os.stdin

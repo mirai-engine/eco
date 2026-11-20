@@ -39,7 +39,7 @@ bulk_cipher_init :: proc(cipher: ^Bulk_Cipher, transcript, seed: []byte, initiat
     sender, receiver := material[:32], material[32:]
     if !initiator { sender, receiver = receiver, sender }
     env: [64]byte
-    if os.get_env(env[:], "ECO_ODIN_BULK_CRYPTO") != "portable" {
+    if os.get_env(env[:], "ECO_BULK_CRYPTO") != "portable" {
         cipher.send.accelerator = eco_aes_context(&sender[0], 1)
         cipher.receive.accelerator = eco_aes_context(&receiver[0], 0)
     }

@@ -46,7 +46,7 @@ void eco_install_signals(void) {
     SetConsoleCtrlHandler(console_signal, TRUE);
 }
 int eco_stopping(void) { return InterlockedCompareExchange(&stopping, 0, 0) != 0; }
-void eco_listening(int port) { fprintf(stderr, "eco-odin listening on UDP %d\n", port); }
+void eco_listening(int port) { fprintf(stderr, "eco listening on UDP %d\n", port); }
 void eco_ring_ready(void) {}
 int eco_ring_setup(void) { return 0; }
 void eco_ring_close(void) {}
@@ -477,7 +477,7 @@ static BOOL token_sid(wchar_t **text) {
 int eco_default_pipe(char *out, int capacity) {
     wchar_t *sid = NULL;
     if (!token_sid(&sid)) return -1;
-    int n = snprintf(out, (size_t)capacity, "\\\\.\\pipe\\eco-odin-%ls", sid);
+    int n = snprintf(out, (size_t)capacity, "\\\\.\\pipe\\eco-%ls", sid);
     LocalFree(sid);
     return n > 0 && n < capacity ? n : -1;
 }
@@ -633,7 +633,7 @@ int eco_unlink(const char *name) { (void)name; return 0; }
 int eco_spawn_pipe(BOOL host_reads, int *host_fd, HANDLE *child) {
     static volatile LONG sequence;
     wchar_t name[128];
-    if (swprintf(name, 128, L"\\\\.\\pipe\\eco-odin-child-%lu-%ld", GetCurrentProcessId(),
+    if (swprintf(name, 128, L"\\\\.\\pipe\\eco-child-%lu-%ld", GetCurrentProcessId(),
                  InterlockedIncrement(&sequence)) < 0) return -1;
     SECURITY_ATTRIBUTES security;
     PSECURITY_DESCRIPTOR descriptor;

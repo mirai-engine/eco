@@ -63,11 +63,11 @@ Pair_Prompt :: struct {
 }
 
 eco_home :: proc() -> string {
-    home := os.get_env("ECO_ODIN_HOME", context.temp_allocator)
+    home := os.get_env("ECO_HOME", context.temp_allocator)
     if home == "" {
         directory, err := os.user_home_dir(context.temp_allocator)
         if err != nil { return "" }
-        home = fmt.tprintf("%s/.eco-odin", directory)
+        home = fmt.tprintf("%s/.eco", directory)
     }
     _ = os.mkdir(home, {.Read_User, .Write_User, .Execute_User})
     return home
@@ -120,9 +120,9 @@ known_server :: proc(address: string, key: []byte) -> bool {
     return false
 }
 
-// ECO_ODIN_PEER pins the server key; otherwise the key that pair stored for the address is used.
+// ECO_PEER pins the server key; otherwise the key that pair stored for the address is used.
 client_peer :: proc(address: string) -> string {
-    if peer := os.get_env("ECO_ODIN_PEER", context.temp_allocator); peer != "" { return peer }
+    if peer := os.get_env("ECO_PEER", context.temp_allocator); peer != "" { return peer }
     key: [32]byte
     if address == "" || !known_server(address, key[:]) { return "" }
     return string(hex.encode(key[:], context.temp_allocator))
@@ -193,7 +193,7 @@ when ODIN_OS != .Linux {
 // Linux servers have no common desktop to ask in, so the operator answers in the server's
 // terminal; Windows and macOS show a dialog in the operator's session.
 start_pair_approval :: proc(p: ^Pairing) -> bool {
-    fmt.printfln("eco-odin: pairing request from %s at %v with code %s%s", string(p.label[:p.label_len]),
+    fmt.printfln("eco: pairing request from %s at %v with code %s%s", string(p.label[:p.label_len]),
                  net.endpoint_to_string(p.remote, context.temp_allocator), string(p.code[:]),
                  ". Approve? [y/n]" when ODIN_OS == .Linux else "")
     when ODIN_OS == .Linux {
@@ -349,28 +349,28 @@ tick_pair :: proc(server: ^Server) {
         line := fmt.tprintf("%s %s", client, string(p.label[:p.label_len]))
         if store_trust(server.clients, client, line) {
             p.status, p.failures = .Approved, 0
-            fmt.printfln("eco-odin: paired %s", string(p.label[:p.label_len]))
+            fmt.printfln("eco: paired %s", string(p.label[:p.label_len]))
         } else {
             p.status = .Denied
-            fmt.eprintln("eco-odin: cannot store the client in", server.clients)
+            fmt.eprintln("eco: cannot store the client in", server.clients)
         }
     case answer == .No:
         p.status = .Denied
         p.failures += 1
-        fmt.println("eco-odin: pairing denied")
+        fmt.println("eco: pairing denied")
     case answer == .Other:
-        fmt.println("eco-odin: answer y or n")
+        fmt.println("eco: answer y or n")
     case time.tick_since(p.started) >= PAIR_WAIT:
         p.status = .Denied
         p.failures += 1
         when ODIN_OS != .Linux { close_pair_approval(string(p.title[:p.title_len])) }
-        fmt.println("eco-odin: pairing request timed out")
+        fmt.println("eco: pairing request timed out")
     }
     if p.status != .Pending {
         p.resolved = time.tick_now()
         if p.failures >= PAIR_FAILURES {
             p.locked = p.resolved
-            fmt.println("eco-odin: pairing paused for ten minutes after repeated denials")
+            fmt.println("eco: pairing paused for ten minutes after repeated denials")
         }
     }
 }
@@ -381,12 +381,12 @@ pair_client :: proc(address: string, name: string) -> int {
     own: ecdh.Private_Key
     defer ecdh.private_key_clear(&own)
     seed: [32]byte
-    key_path := os.get_env("ECO_ODIN_KEY", context.temp_allocator)
+    key_path := os.get_env("ECO_KEY", context.temp_allocator)
     loaded := read_private_seed(key_path, seed[:]) && ecdh.private_key_set_bytes(&own, .X25519, seed[:])
     crypto.zero_explicit(&seed, len(seed))
-    if !loaded { return error_exit("set ECO_ODIN_KEY to a private key file created by keygen") }
+    if !loaded { return error_exit("set ECO_KEY to a private key file created by keygen") }
     known := known_servers_path()
-    if known == "" { return error_exit("cannot locate the home directory; set ECO_ODIN_HOME") }
+    if known == "" { return error_exit("cannot locate the home directory; set ECO_HOME") }
 
     udp, err := net.make_unbound_udp_socket(family(endpoint))
     if err != nil { return error_exit("cannot open UDP", err) }

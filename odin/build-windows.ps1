@@ -46,7 +46,7 @@ try {
     if ($Test) {
         Invoke-Checked $Compiler (@('test') + $Options + @('-out:bin/eco-windows-tests.exe'))
     } else {
-        Invoke-Checked $Compiler (@('build') + $Options + @('-o:speed', '-out:bin/eco-windows-amd64.exe'))
+        Invoke-Checked $Compiler (@('build') + $Options + @('-o:speed', '-out:bin/eco.exe'))
     }
 } finally {
     Pop-Location

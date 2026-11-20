@@ -118,7 +118,7 @@ def main():
         stack.callback(stop.set)
         address = endpoint(sock.getsockname()[1])
         local = base / "client"
-        env = {**os.environ, "ECO_ODIN_SOCKET": str(local), "ECO_ODIN_DESKTOP_SOCKET": helper.server_address}
+        env = {**os.environ, "ECO_SOCKET": str(local), "ECO_DESKTOP_SOCKET": helper.server_address}
         server = stack.enter_context(background("serve", endpoint(port), base / "server.key",
                                                 base / "clients", base, "run", env=env))
         assert b"listening" in server.stderr.readline()
@@ -159,7 +159,7 @@ def main():
                                                   base / "clients", base, "read", env=env))
         assert b"listening" in readonly.stderr.readline()
         readonly_socket = base / "readonly"
-        readonly_env = {**env, "ECO_ODIN_SOCKET": str(readonly_socket)}
+        readonly_env = {**env, "ECO_SOCKET": str(readonly_socket)}
         readonly_client = stack.enter_context(background("client", readonly_socket, endpoint(readonly_port),
                                                          base / "client.key", server_key, env=readonly_env))
         wait_ready(readonly_socket, readonly_client)

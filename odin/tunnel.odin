@@ -157,7 +157,7 @@ tick_relay :: proc(relay: ^Relay, udp: net.UDP_Socket) -> bool {
             case .Done:
                 return false
             case .Failure:
-                fmt.eprintln("eco-odin: tunnel:", string(response[1:]))
+                fmt.eprintln("eco: tunnel:", string(response[1:]))
                 return false
             case:
                 return false
@@ -199,7 +199,7 @@ forward :: proc(bind: net.Endpoint, target_text: string, datagram: bool) -> int 
     if eco_fd_setup(service, 1) < 0 { return error_exit("cannot configure local forward") }
     _ = eco_ring_setup()
     defer eco_ring_close()
-    fmt.eprintfln("eco-odin forwarding port %d -> %s", bind.port, target_text)
+    fmt.eprintfln("eco forwarding port %d -> %s", bind.port, target_text)
     relays: [STREAM_MAX]^Relay
     defer for &relay in relays { if relay != nil { close_relay(&relay) } }
     for eco_stopping() == 0 {
