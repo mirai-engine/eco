@@ -54,15 +54,21 @@ static HANDLE valid_handle(HANDLE handle, int directory) {
     return handle;
 }
 
+static HANDLE local_handle_wide(const wchar_t *path, DWORD access, DWORD disposition,
+                                SECURITY_ATTRIBUTES *security, int directory) {
+    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                security, disposition, FILE_FLAG_OPEN_REPARSE_POINT |
+                                (directory == 1 ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL), NULL);
+    return valid_handle(handle, directory);
+}
+
 static HANDLE local_handle(const char *name, DWORD access, DWORD disposition, SECURITY_ATTRIBUTES *security,
                            int directory) {
     wchar_t *path = eco_wide(name);
     if (!path) return INVALID_HANDLE_VALUE;
-    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                security, disposition, FILE_FLAG_OPEN_REPARSE_POINT |
-                                (directory == 1 ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL), NULL);
+    HANDLE handle = local_handle_wide(path, access, disposition, security, directory);
     free(path);
-    return valid_handle(handle, directory);
+    return handle;
 }
 
 static BOOL valid_component(const char *name, size_t size) {
@@ -336,12 +342,32 @@ int eco_sync_dir(const char *path) {
     return eco_check_private_dir(path) ? 0 : -1;
 }
 
-wchar_t *eco_handle_path(HANDLE handle) {
+static BOOL same_directory(HANDLE directory, const wchar_t *path) {
+    HANDLE ordinary = local_handle_wide(path, FILE_READ_ATTRIBUTES, OPEN_EXISTING, NULL, 1);
+    if (ordinary == INVALID_HANDLE_VALUE) return FALSE;
+    FILE_ID_INFO original_id, ordinary_id;
+    BOOL same = GetFileInformationByHandleEx(directory, FileIdInfo, &original_id, sizeof(original_id)) &&
+                GetFileInformationByHandleEx(ordinary, FileIdInfo, &ordinary_id, sizeof(ordinary_id)) &&
+                original_id.VolumeSerialNumber == ordinary_id.VolumeSerialNumber &&
+                !memcmp(&original_id.FileId, &ordinary_id.FileId, sizeof(original_id.FileId));
+    CloseHandle(ordinary);
+    return same;
+}
+
+wchar_t *eco_working_directory(HANDLE handle) {
+    const size_t prefix_length = 4;
     DWORD length = GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (!length || length >= 32767) return NULL;
     wchar_t *path = malloc((size_t)length * sizeof(*path));
     if (!path) return NULL;
     DWORD used = GetFinalPathNameByHandleW(handle, path, length, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (!used || used >= length) { free(path); return NULL; }
+    // Some shells reject the extended spelling of a drive path as their current directory.
+    if (used >= prefix_length + 3 && used - prefix_length < MAX_PATH &&
+        wcsncmp(path, L"\\\\?\\", prefix_length) == 0) {
+        const wchar_t *ordinary = path + prefix_length;
+        if (ordinary[1] == L':' && ordinary[2] == L'\\' && same_directory(handle, ordinary))
+            memmove(path, ordinary, (used - prefix_length + 1) * sizeof(*path));
+    }
     return path;
 }

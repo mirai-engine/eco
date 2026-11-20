@@ -29,12 +29,14 @@ static wchar_t *command_line(char *const args[]) {
     for (int i = 0; args[i]; ++i) {
         wchar_t *argument = eco_wide(args[i]);
         if (!argument) { free(line.text); return NULL; }
-        BOOL ok = (!i || put(&line, L' ', 1)) && put(&line, L'"', 1);
+        BOOL quoted = !*argument || wcspbrk(argument, L" \t\"");
+        BOOL ok = (!i || put(&line, L' ', 1)) && (!quoted || put(&line, L'"', 1));
         size_t slashes = 0;
         for (const wchar_t *p = argument; ok; ++p) {
             if (*p == L'\\') { ++slashes; continue; }
             if (!*p) {
-                ok = put(&line, L'\\', slashes * 2) && put(&line, L'"', 1);
+                ok = put(&line, L'\\', quoted ? slashes * 2 : slashes) &&
+                     (!quoted || put(&line, L'"', 1));
                 break;
             }
             if (*p == L'"') slashes = slashes * 2 + 1;
@@ -186,7 +188,7 @@ static void close_handles(HANDLE handles[3]) {
 int eco_spawn(char *const args[], int fds[2], int workdir, int *to_child, int scope) {
     if (scope >= 0) return -1;
     EcoDescriptor *dir = eco_descriptor(workdir);
-    wchar_t *directory = dir ? eco_handle_path(dir->input) : NULL;
+    wchar_t *directory = dir ? eco_working_directory(dir->input) : NULL;
     if (!directory) return -1;
     HANDLE handles[3] = {0}, job = NULL;
     int host[3] = {-1, -1, -1};
@@ -216,7 +218,7 @@ int eco_spawn_pty(char *const args[], int *master, int workdir, unsigned short r
                  unsigned short cols, int scope) {
     if (scope >= 0 || !rows || !cols || rows > SHRT_MAX || cols > SHRT_MAX) return -1;
     EcoDescriptor *dir = eco_descriptor(workdir);
-    wchar_t *directory = dir ? eco_handle_path(dir->input) : NULL;
+    wchar_t *directory = dir ? eco_working_directory(dir->input) : NULL;
     if (!directory) return -1;
 
     int input = -1, output = -1, id = -1;

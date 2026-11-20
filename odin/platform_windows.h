@@ -45,7 +45,7 @@ int eco_async_pipe(HANDLE input, HANDLE output);
 int eco_spawn_pipe(BOOL host_reads, int *host_fd, HANDLE *child);
 int eco_close(int fd);
 wchar_t *eco_wide(const char *text);
-wchar_t *eco_handle_path(HANDLE handle);
+wchar_t *eco_working_directory(HANDLE handle);
 int eco_pipe_security(SECURITY_ATTRIBUTES *security, PSECURITY_DESCRIPTOR *descriptor);
 BOOL eco_private_owner(HANDLE handle, BOOL check_permissions);
 void eco_post_wakeup(void);

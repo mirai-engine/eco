@@ -286,6 +286,8 @@ def main():
         base = Path(folder)
         root, jobs = base / "remote-é", base / "jobs"
         root.mkdir()
+        nested = root / "nested directory"
+        nested.mkdir()
         jobs.mkdir()
         outside = base / "outside"
         outside.mkdir()
@@ -320,6 +322,11 @@ def main():
                 assert run("ping", env=env).stdout.startswith(b"pong")
                 run("ping-early", address, client_key, server_public, env=env)
 
+                for cwd, expected in (((), root), (("--cwd", nested.name), nested)):
+                    result = run("run", *cwd, "--", "cmd.exe", "/d", "/u", "/c", "cd", env=env)
+                    assert not result.stderr, result.stderr
+                    assert Path(result.stdout.decode("utf-16-le").strip()).samefile(expected), result.stdout
+
                 data = bytes(range(256)) * 1000
                 source, copied = base / "source-é", base / "copied-é"
                 source.write_bytes(data)
@@ -341,10 +348,10 @@ def main():
                     os.rmdir(junction)
 
                 command = ("run", "--", sys.executable, "-c",
-                           "import sys;print(sys.argv[1]);print('err',file=sys.stderr);sys.exit(7)",
-                           'spaces " quotes \\')
+                           "import sys;print(*sys.argv[1:],sep='|');print('err',file=sys.stderr);sys.exit(7)",
+                           'spaces " quotes \\', 'plain\\', '')
                 result = run(*command, env=env, checked=False)
-                assert result.returncode == 7 and result.stdout.strip() == b'spaces " quotes \\'
+                assert result.returncode == 7 and result.stdout.strip() == b'spaces " quotes \\|plain\\|'
                 assert result.stderr.strip() == b"err"
                 echo = run("run", "--stdin", "--", sys.executable, "-c",
                            "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())", env=env, data=data)
