@@ -114,7 +114,7 @@ job_exists :: proc(path, part: string) -> bool {
 
 open_job :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, body: []byte) {
     namespace := ensure_job_namespace(server, stream.link)
-    if namespace == "" { fail_call(stream, call, "job store unavailable"); return }
+    if namespace == "" { fail_call(stream, call, "cannot access the configured background job storage"); return }
     defer delete(namespace)
 
     if call.op == .Jobs && len(body) == 0 {

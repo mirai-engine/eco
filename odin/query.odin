@@ -29,12 +29,16 @@ answer_query :: proc(link: ^Link, request: []byte) {
         if link.rights & CAP_READ == 0 { query_error(link, id, "reads are disabled"); return }
         leaf: [256]byte
         parent := parent_for(link.scope, data, &leaf)
-        if parent < 0 { query_error(link, id, "invalid or inaccessible path"); return }
+        if parent < 0 {
+            query_error(link, id, path_error(parent, "invalid or inaccessible path"))
+            return
+        }
         defer _ = eco_close(parent)
         size, stamp: u64
         kind: u8
-        if eco_stat(parent, cstring(&leaf[0]), &size, &kind, &stamp) < 0 {
-            query_error(link, id, "path does not exist or cannot be inspected")
+        status := eco_stat(parent, cstring(&leaf[0]), &size, &kind, &stamp)
+        if status < 0 {
+            query_error(link, id, path_error(status, "path does not exist or cannot be inspected"))
             return
         }
         metadata: [17]byte

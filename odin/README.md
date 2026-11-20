@@ -2,7 +2,8 @@
 
 ECO's Odin implementation uses a fixed `Noise_IK_25519_ChaChaPoly_BLAKE2s` suite and preconfigured
 X25519 public keys. The local CLI talks to a small daemon over an owner-only Unix socket. The daemon
-shares one authenticated UDP session across independent command, terminal, file and tunnel streams.
+shares an authenticated UDP session across independent command, terminal, file and tunnel streams.
+When the session rotates, streams on the previous session continue to receive keepalives.
 The wire protocol uses binary records, and file transfers use BLAKE3.
 
 ## Build and pair
@@ -96,7 +97,8 @@ eco-odin kill "$job"
 `run`, `tty` and `start` accept command arguments and a working directory totaling up to
 128 KiB of encoded request data. The remote operating system can impose a smaller limit.
 Use `run --stdin` for script input or other streamed data. A command's timeout includes draining
-its output. Windows exit codes above 255 are printed in hexadecimal. On macOS and Linux
+its output. A responsive stream stays open even while a command produces no output.
+Windows exit codes above 255 are printed in hexadecimal. On macOS and Linux
 the CLI returns 125 for those codes because the local process status has only eight bits.
 
 File paths are relative to the server root or the granted subdirectory. Native operations walk
@@ -121,8 +123,9 @@ queue per sender.
 `start --id HEX` accepts a 32-character idempotency key. A detached worker owns the process and
 spools stdout, stderr and the exit status to disk. `attach` works across server and client daemon
 restarts. A worker that exits without publishing a result leaves an indeterminate job and the server
-does not rerun it. Jobs require an explicit store, retain at most 64 MiB per output stream and remain
-on disk until the operator removes them. A machine reboot can terminate the workers themselves.
+does not rerun it. Set `ECO_ODIN_JOBS` on the server to enable background job storage.
+Jobs retain at most 64 MiB per output stream and remain on disk until the operator removes them.
+A machine reboot can terminate the workers themselves.
 
 ## Adapters for agents and tools
 

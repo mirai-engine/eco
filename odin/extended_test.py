@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Integration coverage for permissions, migration, tunnels and durable jobs."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import fcntl
 import os
@@ -152,7 +153,7 @@ def test_tunnels(env):
 
 
 class Fault_Proxy:
-    def __init__(self, port):
+    def __init__(self, port, forward_response=None):
         self.target = ("127.0.0.1", port)
         self.front, self.back = self.make_socket(), self.make_socket()
         self.port = self.front.getsockname()[1]
@@ -160,6 +161,7 @@ class Fault_Proxy:
         self.rebind = threading.Event()
         self.changed = threading.Event()
         self.client = None
+        self.forward_response = forward_response
         self.count = 0
         self.rebind_after = None
         self.dropped = self.duplicated = self.reordered = self.tampered = 0
@@ -203,7 +205,7 @@ class Fault_Proxy:
                     if source is self.front:
                         self.client = sender
                         out, address = self.back, self.target
-                    elif self.client:
+                    elif self.client and (self.forward_response is None or self.forward_response(packet)):
                         out, address = self.front, self.client
                     else:
                         continue
@@ -227,6 +229,47 @@ class Fault_Proxy:
                     out, address, packet, _ = deferred
                     out.sendto(packet, address)
                     deferred = None
+
+
+def test_stream_liveness(base, root, server_port, client_secret, server_key, env):
+    with ExitStack() as stack, ThreadPoolExecutor(max_workers=2) as pool:
+        for name, responsive in (("silent", True), ("unresponsive", False)):
+            gated = threading.Event()
+
+            def forward_response(packet, gated=gated, responsive=responsive):
+                # Pass session keepalives (7) in both cases. Only the live stream gets
+                # Stream_Alive (14). Drop KCP acknowledgments and other stream data.
+                return not gated.is_set() or packet[4:5] == b"\x07" or (
+                    responsive and packet[4:5] == b"\x0e"
+                )
+
+            proxy = stack.enter_context(Fault_Proxy(server_port, forward_response))
+            local = base / name
+            settings = {**env, "ECO_ODIN_SOCKET": str(local)}
+            client = stack.enter_context(
+                background("client", local, endpoint(proxy.port), client_secret, server_key, env=settings)
+            )
+            wait_ready(local, client)
+            command = f"touch {name}; while [ ! -f release ]; do sleep 0.1; done; printf finished"
+            call = pool.submit(cli, "run", "--timeout-ms", "55000", "--", "/bin/sh", "-c", command,
+                               env=settings, timeout=60, check=False)
+            wait_ready(root / name, client)
+            gated.set()
+            if responsive:
+                live, live_gate = call, gated
+                quiet_since = time.monotonic()
+            else:
+                lost = call
+
+        result = lost.result(timeout=55)
+        assert result.returncode and b"remote stream timed out" in result.stderr, result
+        time.sleep(max(0, quiet_since + 46 - time.monotonic()))
+        assert not live.done(), live.result()
+        live_gate.clear()
+        (root / "release").touch()
+        result = live.result(timeout=5)
+        assert (result.returncode, result.stdout, result.stderr) == (0, b"finished", b""), result
+    print("silent stream survived the active timeout and an unresponsive stream expired", flush=True)
 
 
 def test_faults(base, server_port, client_secret, server_key, env):
@@ -329,8 +372,11 @@ def test_bulk(base, root, server_secret, server_key, client_secret, client_key, 
         cli("put", source, "bulk-fixture", env=settings)
         cli("get", "bulk-fixture", result, env=settings)
         assert result.read_bytes() == data
-        assert cli("get", "../server", result, env=settings, check=False).returncode
+        for args in (("get", "../server", result), ("put", source, "../outside")):
+            rejected = cli(*args, env=settings, check=False)
+            assert rejected.returncode and b"path escapes the server root" in rejected.stderr, rejected
         assert result.read_bytes() == data
+        assert not (root.parent / "outside").exists()
         wrong_client = base / "other-client"
         cli("keygen", wrong_client)
         wrong = {**settings, "ECO_ODIN_KEY": str(wrong_client)}
@@ -391,6 +437,7 @@ def main():
             test_run_output(env)
             test_tunnels(env)
             test_faults(base, port, client_secret, server_key, env)
+            test_stream_liveness(base, root, port, client_secret, server_key, env)
             test_capabilities(base, root, server_secret, server_key, client_secret, client_key, env)
             test_bulk(base, root, server_secret, server_key, client_secret, client_key, env)
             test_jobs(stack, base, root, port, server_secret, client_secret, server_key, client_key, env)

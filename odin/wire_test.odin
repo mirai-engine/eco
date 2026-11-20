@@ -3,6 +3,34 @@ package eco
 import "core:crypto/ecdh"
 import "core:crypto/noise"
 import "core:testing"
+import "core:time"
+
+@(test)
+keepalives_cover_rotated_links :: proc(t: ^testing.T) {
+    current, rotated, idle, closing: Link
+    stream: Stream
+    current.streams[0] = &stream
+    rotated.streams[0] = &stream
+    closing.streams[0] = &stream
+    closing.closing = true
+    now := time.tick_now()
+    bridge := Bridge{link = &current, keepalive = now}
+    bridge.links[0], bridge.links[1], bridge.links[2], bridge.links[3] = &current, &rotated, &idle, &closing
+
+    tick_keepalives(&bridge, time.tick_add(now, 24*time.Second))
+    testing.expect_value(t, rotated.send_number, u64(0))
+    tick_keepalives(&bridge, time.tick_add(now, 25*time.Second))
+    testing.expect_value(t, current.send_number, u64(1))
+    testing.expect_value(t, rotated.send_number, u64(1))
+    testing.expect_value(t, idle.send_number, u64(0))
+    testing.expect_value(t, closing.send_number, u64(0))
+
+    bridge.link = nil
+    current.streams[0] = nil
+    tick_keepalives(&bridge, time.tick_add(now, 50*time.Second))
+    testing.expect_value(t, current.send_number, u64(1))
+    testing.expect_value(t, rotated.send_number, u64(2))
+}
 
 @(test)
 replay_window_tests :: proc(t: ^testing.T) {

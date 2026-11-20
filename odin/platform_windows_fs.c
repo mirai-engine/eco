@@ -1,4 +1,5 @@
 #include "platform_windows.h"
+#include "platform_paths.h"
 #include <winternl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,9 @@
 #ifndef FILE_NON_DIRECTORY_FILE
 #define FILE_NON_DIRECTORY_FILE 0x40
 #endif
+#ifndef STATUS_REPARSE_POINT_ENCOUNTERED
+#define STATUS_REPARSE_POINT_ENCOUNTERED ((NTSTATUS)0xC000050B)
+#endif
 
 typedef NTSTATUS (NTAPI *NtCreateFileFn)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
     PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
@@ -43,9 +47,11 @@ static DWORD attributes(HANDLE handle) {
     return info.FileAttributes;
 }
 
-static HANDLE valid_handle(HANDLE handle, int directory) {
+static HANDLE valid_handle(HANDLE handle, int directory, int *failure) {
     if (handle == INVALID_HANDLE_VALUE) return handle;
     DWORD attrs = attributes(handle);
+    if (failure && attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+        *failure = ECO_PATH_LINK_BLOCKED;
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ||
         (directory >= 0 && ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory)) {
         CloseHandle(handle);
@@ -59,7 +65,7 @@ static HANDLE local_handle_wide(const wchar_t *path, DWORD access, DWORD disposi
     HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 security, disposition, FILE_FLAG_OPEN_REPARSE_POINT |
                                 (directory == 1 ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL), NULL);
-    return valid_handle(handle, directory);
+    return valid_handle(handle, directory, NULL);
 }
 
 static HANDLE local_handle(const char *name, DWORD access, DWORD disposition, SECURITY_ATTRIBUTES *security,
@@ -82,7 +88,7 @@ static BOOL valid_component(const char *name, size_t size) {
 }
 
 static HANDLE open_relative(HANDLE dir, const char *name, ACCESS_MASK access, ULONG disposition,
-                            int directory) {
+                            int directory, int *failure) {
     if (!dir || dir == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
     if (!strcmp(name, ".") && directory != 0 && disposition == FILE_OPEN) {
         HANDLE duplicate;
@@ -107,14 +113,18 @@ static HANDLE open_relative(HANDLE dir, const char *name, ACCESS_MASK access, UL
                                       FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                       disposition, options, NULL, 0) : -1;
     free(wide);
-    if (status < 0) return INVALID_HANDLE_VALUE;
-    return valid_handle(value, directory);
+    if (status < 0) {
+        if (failure && status == STATUS_REPARSE_POINT_ENCOUNTERED) *failure = ECO_PATH_LINK_BLOCKED;
+        return INVALID_HANDLE_VALUE;
+    }
+    return valid_handle(value, directory, failure);
 }
 
-static HANDLE file_at(int dir, const char *name, ACCESS_MASK access, ULONG disposition, int directory) {
+static HANDLE file_at(int dir, const char *name, ACCESS_MASK access, ULONG disposition,
+                      int directory, int *failure) {
     EcoDescriptor *entry = eco_descriptor(dir);
     if (!entry || entry->type != EC_FILE) return INVALID_HANDLE_VALUE;
-    return open_relative(entry->input, name, access, disposition, directory);
+    return open_relative(entry->input, name, access, disposition, directory, failure);
 }
 
 #define DIRECTORY_ACCESS (FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL)
@@ -124,7 +134,7 @@ int eco_root(const char *name) {
 }
 
 int eco_parent(int root, const char *path, char *leaf, int capacity) {
-    HANDLE dir = file_at(root, ".", DIRECTORY_ACCESS, FILE_OPEN, 1);
+    HANDLE dir = file_at(root, ".", DIRECTORY_ACCESS, FILE_OPEN, 1, NULL);
     if (dir == INVALID_HANDLE_VALUE) return -1;
     const char *part = path;
     while (1) {
@@ -134,9 +144,10 @@ int eco_parent(int root, const char *path, char *leaf, int capacity) {
         memcpy(leaf, part, length);
         leaf[length] = 0;
         if (!part[length]) return eco_file_handle(dir);
-        HANDLE next = open_relative(dir, leaf, DIRECTORY_ACCESS, FILE_OPEN, 1);
+        int failure = -1;
+        HANDLE next = open_relative(dir, leaf, DIRECTORY_ACCESS, FILE_OPEN, 1, &failure);
         CloseHandle(dir);
-        if (next == INVALID_HANDLE_VALUE) return -1;
+        if (next == INVALID_HANDLE_VALUE) return failure;
         dir = next;
         part += length + 1;
     }
@@ -145,13 +156,16 @@ int eco_parent(int root, const char *path, char *leaf, int capacity) {
 }
 
 int eco_open(int dir, const char *leaf, int want_dir) {
-    return eco_file_handle(file_at(dir, leaf, want_dir ? DIRECTORY_ACCESS : FILE_GENERIC_READ, FILE_OPEN,
-                                   want_dir != 0));
+    int failure = -1;
+    HANDLE file = file_at(dir, leaf, want_dir ? DIRECTORY_ACCESS : FILE_GENERIC_READ, FILE_OPEN,
+                          want_dir != 0, &failure);
+    return file == INVALID_HANDLE_VALUE ? failure : eco_file_handle(file);
 }
 
 int eco_stat(int dir, const char *leaf, uint64_t *size, uint8_t *kind, uint64_t *stamp) {
-    HANDLE file = file_at(dir, leaf, FILE_READ_ATTRIBUTES, FILE_OPEN, -1);
-    if (file == INVALID_HANDLE_VALUE) return -1;
+    int failure = -1;
+    HANDLE file = file_at(dir, leaf, FILE_READ_ATTRIBUTES, FILE_OPEN, -1, &failure);
+    if (file == INVALID_HANDLE_VALUE) return failure;
     FILE_STANDARD_INFO std;
     FILE_BASIC_INFO basic;
     BOOL ok = GetFileInformationByHandleEx(file, FileStandardInfo, &std, sizeof(std)) &&
@@ -225,7 +239,7 @@ int eco_dir_next(void *handle, char *out, int capacity) {
 }
 
 int eco_file_create(int dir, const char *name) {
-    return eco_file_handle(file_at(dir, name, FILE_GENERIC_WRITE, FILE_CREATE, 0));
+    return eco_file_handle(file_at(dir, name, FILE_GENERIC_WRITE, FILE_CREATE, 0, NULL));
 }
 
 typedef struct EcoRename {
@@ -238,7 +252,7 @@ typedef struct EcoRename {
 int eco_rename(int dir, const char *from, const char *to) {
     EcoDescriptor *parent = eco_descriptor(dir);
     if (!parent || !valid_component(to, strlen(to))) return -1;
-    HANDLE file = file_at(dir, from, DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN, 0);
+    HANDLE file = file_at(dir, from, DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN, 0, NULL);
     if (file == INVALID_HANDLE_VALUE) return -1;
     wchar_t *wide = eco_wide(to);
     size_t bytes = wide ? wcslen(wide) * sizeof(*wide) : 0;
@@ -262,7 +276,7 @@ int eco_rename(int dir, const char *from, const char *to) {
 }
 
 int eco_remove(int dir, const char *name) {
-    HANDLE file = file_at(dir, name, DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN, 0);
+    HANDLE file = file_at(dir, name, DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN, 0, NULL);
     if (file == INVALID_HANDLE_VALUE) return -1;
     FILE_DISPOSITION_INFO remove = {.DeleteFile = TRUE};
     BOOL ok = SetFileInformationByHandle(file, FileDispositionInfo, &remove, sizeof(remove));
@@ -290,7 +304,7 @@ int eco_lock_local(const char *name) {
     PSECURITY_DESCRIPTOR descriptor;
     if (eco_pipe_security(&security, &descriptor) < 0) { free(wide); return -1; }
     HANDLE file = valid_handle(CreateFileW(wide, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
-                                0, &security, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL), 0);
+                                0, &security, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL), 0, NULL);
     LocalFree(descriptor);
     free(wide);
     if (file == INVALID_HANDLE_VALUE) return -1;

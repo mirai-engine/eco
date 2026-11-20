@@ -78,7 +78,8 @@ def main():
         local_socket = base / "s"
         env = {**os.environ, "ECO_ODIN_SOCKET": str(local_socket)}
 
-        with background("serve", address, server_secret, clients, root, "run") as server:
+        with background("serve", address, server_secret, clients, root, "run",
+                        env={**env, "ECO_ODIN_JOBS": ""}) as server:
             assert server.stderr.readline().startswith(b"eco-odin listening")
             assert cli("ping-early", address, client_secret, server_key).stdout.startswith(b"pong")
             stranger = keys / "stranger"
@@ -105,8 +106,33 @@ def main():
                 assert len(cli("hash", "fixture", env=env).stdout.strip()) == 64
                 assert cli("hash", ".", env=env, check=False).returncode != 0
                 (root / "outside").symlink_to(keys)
-                for path in ["../keys/server", "outside/server", "/etc/passwd"]:
-                    assert cli("read", path, env=env, check=False).returncode != 0
+                for args in [
+                    ("read", str(keys / "server")),
+                    ("stat", "../keys/server"),
+                    ("list", "missing/../../keys"),
+                    ("get", "../keys/server", result),
+                    ("put", source, "../keys/should-not-write"),
+                    ("run", "--cwd", "..", "--", "/usr/bin/true"),
+                ]:
+                    rejected = cli(*args, env=env, check=False)
+                    assert rejected.returncode and b"path escapes the server root" in rejected.stderr, rejected
+                assert result.read_bytes() == content
+                assert not (keys / "should-not-write").exists()
+                for path in ("outside", "outside/server"):
+                    rejected = cli("read", path, env=env, check=False)
+                    assert rejected.returncode and b"symlink or reparse point" in rejected.stderr, rejected
+
+                job_id = "1" * 32
+                for args in [
+                    ("start", "--", "/usr/bin/true"),
+                    ("start", "--", "/bin/sh", "-c", "#" * 2048),
+                    ("attach", job_id),
+                    ("jobs",),
+                    ("kill", job_id),
+                ]:
+                    rejected = cli(*args, env=env, check=False)
+                    assert rejected.returncode and b"background job storage is not configured" in rejected.stderr, rejected
+                    assert b"ECO_ODIN_JOBS" in rejected.stderr, rejected
 
                 with socket.socket(socket.AF_UNIX) as local:
                     local.settimeout(4)

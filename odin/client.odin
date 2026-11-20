@@ -124,10 +124,18 @@ connect_bridge :: proc(bridge: ^Bridge) -> bool {
         }
         slot = link
         bridge.link = link
-        bridge.keepalive = time.tick_now()
         return true
     }
     return false
+}
+
+tick_keepalives :: proc(bridge: ^Bridge, now: time.Tick) {
+    if time.tick_diff(bridge.keepalive, now) < 25*time.Second { return }
+    bridge.keepalive = now
+    for link in bridge.links {
+        if link == nil || link.closing || (link != bridge.link && !has_streams(link)) { continue }
+        _ = send_record(link, .Keepalive, []byte{0}, link.remote)
+    }
 }
 
 read_call_input :: proc(call: ^Local_Call) -> ([]byte, bool) {
@@ -286,7 +294,9 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
 
     _ = eco_ring_setup()
     defer eco_ring_close()
-    bridge := Bridge{endpoint = endpoint, udp = udp, udp_fd = udp_fd, own = own, peer = peer, idle = time.tick_now(), token = token}
+    started := time.tick_now()
+    bridge := Bridge{endpoint = endpoint, udp = udp, udp_fd = udp_fd, own = own, peer = peer,
+                     idle = started, keepalive = started, token = token}
     defer {
         for &call in bridge.calls { close_local(&call) }
         for &link in bridge.links { if link != nil { close_client_link(&link) } }
@@ -363,10 +373,7 @@ client_daemon :: proc(path: string, endpoint: net.Endpoint, own: ^ecdh.Private_K
         if active {
             bridge.idle = time.tick_now()
         }
-        if bridge.link != nil && time.tick_since(bridge.keepalive) >= 25*time.Second {
-            _ = send_record(bridge.link, .Keepalive, []byte{0}, bridge.link.remote)
-            bridge.keepalive = time.tick_now()
-        }
+        tick_keepalives(&bridge, time.tick_now())
         if !active && time.tick_since(bridge.idle) >= IDLE_LIFETIME { break }
         for &link in bridge.links {
             if link == nil { continue }

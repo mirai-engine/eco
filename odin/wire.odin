@@ -94,7 +94,7 @@ POLL_CLOSED :: 8 | 16 | 32
 
 Packet_Kind :: enum u8 {
     Hello = 1, Welcome, Data, Path_Challenge, Path_Response, Confirm, Keepalive, Close, Query, Query_Result,
-    Pair, Pair_Reply, Desktop_Frame,
+    Pair, Pair_Reply, Desktop_Frame, Stream_Alive,
 }
 
 Record :: struct {
@@ -181,7 +181,7 @@ parse_header :: proc(data: []byte) -> (Record, bool) {
     }
     kind := Packet_Kind(data[4])
     id, nonce := get_u64(data[8:]), get_u64(data[16:])
-    if kind < .Hello || kind > .Desktop_Frame || id == 0 {
+    if kind < .Hello || kind > .Stream_Alive || id == 0 {
         return {}, false
     }
     return {kind, id, nonce}, true
@@ -473,6 +473,12 @@ receive_record :: proc(link: ^Link, header: Record, from: net.Endpoint, packet, 
     }
     if header.kind == (.Query if accept_new else .Query_Result) { return plain }
     if !accept_new && header.kind == .Desktop_Frame { return plain }
+    if !accept_new && header.kind == .Stream_Alive && len(plain) == 4 {
+        if stream := find_stream(link, get_u32(plain)); stream != nil {
+            stream.last_seen = link.seen
+        }
+        return nil
+    }
     if header.kind != .Data || !valid_segments(plain) { return nil }
     id := get_u32(plain)
     stream := find_stream(link, id)

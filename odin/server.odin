@@ -58,6 +58,8 @@ Server_Call :: struct {
 }
 
 CALL_QUEUE :: 8
+PATH_OUTSIDE_ROOT :: -2
+PATH_LINK_BLOCKED :: -3
 
 reply :: proc(stream: ^Stream, op: Op, body: []byte = nil) {
     _ = send_message(stream, u8(op), body)
@@ -124,17 +126,41 @@ parent_for :: proc(root: c.int, path: []byte, leaf: ^[256]byte) -> c.int {
     if len(path) == 0 || len(path) >= MESSAGE_MAX || strings.index_byte(string(path), 0) >= 0 {
         return -1
     }
+    if path[0] == '/' { return PATH_OUTSIDE_ROOT }
+    when ODIN_OS == .Windows {
+        if path[0] == '\\' || (len(path) > 1 && path[1] == ':') { return PATH_OUTSIDE_ROOT }
+    }
+    start := 0
+    for i in 0..=len(path) {
+        if i < len(path) {
+            separator := path[i] == '/'
+            when ODIN_OS == .Windows { separator = separator || path[i] == '\\' }
+            if !separator { continue }
+        }
+        if string(path[start:i]) == ".." { return PATH_OUTSIDE_ROOT }
+        start = i+1
+    }
     name: [MESSAGE_MAX]byte
     copy(name[:], path)
     return eco_parent(root, cstring(&name[0]), raw_data(leaf[:]), c.int(len(leaf)))
 }
 
+path_error :: proc(status: c.int, fallback: string) -> string {
+    switch status {
+    case PATH_OUTSIDE_ROOT:
+        return "path escapes the server root or granted directory. Use a relative path without '..'."
+    case PATH_LINK_BLOCKED:
+        return "path uses a symlink or reparse point. Use a direct path inside the server root."
+    }
+    return fallback
+}
+
 stat_call :: proc(stream: ^Stream, call: ^Server_Call, first: bool) -> bool {
     size, stamp: u64
     kind: u8
-    exists := eco_stat(call.parent, cstring(&call.leaf[0]), &size, &kind, &stamp) == 0
-    if !exists && first {
-        fail_call(stream, call, "path does not exist or cannot be inspected")
+    status := eco_stat(call.parent, cstring(&call.leaf[0]), &size, &kind, &stamp)
+    if status < 0 && first {
+        fail_call(stream, call, path_error(status, "path does not exist or cannot be inspected"))
         return false
     }
     if first || size != call.size || stamp != call.stamp || kind != call.kind {
@@ -168,12 +194,12 @@ start_process :: proc(root: c.int, call: ^Server_Call, data: []byte, confined :=
 
     parent := parent_for(root, body[:cwd_end], &call.leaf)
     if parent < 0 {
-        return "invalid work directory"
+        return path_error(parent, "invalid or inaccessible working directory")
     }
     defer _ = eco_close(parent)
     dir := eco_open(parent, cstring(&call.leaf[0]), 1)
     if dir < 0 {
-        return "cannot open work directory"
+        return path_error(dir, "cannot open working directory")
     }
     defer _ = eco_close(dir)
 
@@ -235,14 +261,19 @@ open_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message:
 }
 
 allow_command :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call) -> bool {
-    allowed := server.access == .Run && stream.link.rights & CAP_RUN != 0
-    if call.op >= .Start && call.op <= .Kill {
-        allowed = allowed && server.jobs != "" && (!stream.link.confined || eco_scope_supported() == 1)
-        if !allowed { fail_call(stream, call, "persistent jobs are disabled") }
-    } else if !allowed {
-        fail_call(stream, call, "execution is disabled")
+    job := call.op >= .Start && call.op <= .Kill
+    error: string
+    if server.access != .Run || stream.link.rights & CAP_RUN == 0 {
+        error = "persistent jobs are disabled" if job else "execution is disabled"
+    } else if job {
+        if server.jobs == "" {
+            error = "background job storage is not configured. Set ECO_ODIN_JOBS on the server."
+        } else if stream.link.confined && eco_scope_supported() != 1 {
+            error = "OS cannot enforce the execution scope"
+        }
     }
-    return allowed
+    if error != "" { fail_call(stream, call, error) }
+    return error == ""
 }
 
 open_operation :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, body: []byte) {
@@ -286,21 +317,31 @@ open_operation :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, bod
         return
     }
     call.parent = parent_for(stream.link.scope, body, &call.leaf)
-    if call.parent < 0 { fail_call(stream, call, "invalid or inaccessible path"); return }
+    if call.parent < 0 {
+        fail_call(stream, call, path_error(call.parent, "invalid or inaccessible path"))
+        return
+    }
     leaf := cstring(&call.leaf[0])
     #partial switch call.op {
     case .Stat, .Watch:
         if stat_call(stream, call, true) && call.op == .Stat { finish_call(stream, call, 0) }
     case .List:
         dir := eco_open(call.parent, leaf, 1)
-        if dir >= 0 {
-            call.directory = eco_directory(dir)
-            if call.directory == nil { _ = eco_close(dir) }
+        if dir < 0 {
+            fail_call(stream, call, path_error(dir, "cannot open directory"))
+            return
         }
-        if call.directory == nil { fail_call(stream, call, "cannot open directory") }
+        call.directory = eco_directory(dir)
+        if call.directory == nil {
+            _ = eco_close(dir)
+            fail_call(stream, call, "cannot open directory")
+        }
     case .Read, .Hash:
         call.file = eco_open(call.parent, leaf, 0)
-        if call.file < 0 { fail_call(stream, call, "cannot open regular file"); return }
+        if call.file < 0 {
+            fail_call(stream, call, path_error(call.file, "cannot open regular file"))
+            return
+        }
         blake3.init(&call.hashing)
     case .Write:
         ticket: [16]byte
@@ -333,7 +374,12 @@ write_fd :: proc(fd: c.int, data: []byte) -> bool {
 receive_call :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, message: []byte) {
     op := Op(message[0])
     body := message[1:]
-    if op == .Touch && len(body) == 0 { return }
+    if op == .Touch && len(body) == 0 {
+        id: [4]byte
+        put_u32(id[:], stream.id)
+        _ = send_record(stream.link, .Stream_Alive, id[:], stream.link.remote)
+        return
+    }
     if op == .Cancel && len(body) == 0 {
         finish_call(stream, call, 130)
         return

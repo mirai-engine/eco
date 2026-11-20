@@ -342,8 +342,14 @@ def main():
                 subprocess.run(["cmd", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
                                capture_output=True, check=True)
                 try:
-                    for path in ("../outside/outside.txt", "junction/outside.txt", "payload-é:stream"):
-                        assert run("read", path, env=env, checked=False).returncode != 0
+                    for path in ("../outside/outside.txt", r"..\outside\outside.txt",
+                                 str(outside / "outside.txt")):
+                        result = run("stat", path, env=env, checked=False)
+                        assert result.returncode and b"path escapes the server root" in result.stderr, result
+                    for path in ("junction", "junction/outside.txt"):
+                        result = run("stat", path, env=env, checked=False)
+                        assert result.returncode and b"symlink or reparse point" in result.stderr, result
+                    assert run("read", "payload-é:stream", env=env, checked=False).returncode != 0
                 finally:
                     os.rmdir(junction)
 

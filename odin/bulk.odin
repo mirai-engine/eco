@@ -135,7 +135,7 @@ bulk_server_transfer :: proc(fd, scope: c.int, rights: u8, access: Access, ciphe
     leaf: [256]byte
     parent := parent_for(scope, request[1:], &leaf)
     if parent < 0 {
-        bulk_fail(fd, cipher, buffer[:], "invalid or inaccessible path")
+        bulk_fail(fd, cipher, buffer[:], path_error(parent, "invalid or inaccessible path"))
         return false
     }
     defer _ = eco_close(parent)
@@ -145,7 +145,7 @@ bulk_server_transfer :: proc(fd, scope: c.int, rights: u8, access: Access, ciphe
     if download {
         file := eco_open(parent, name, 0)
         if file < 0 {
-            bulk_fail(fd, cipher, buffer[:], "cannot open regular file")
+            bulk_fail(fd, cipher, buffer[:], path_error(file, "cannot open regular file"))
             return false
         }
         defer _ = eco_close(file)

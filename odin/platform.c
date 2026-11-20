@@ -25,6 +25,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "platform_paths.h"
 
 extern char **environ;
 int eco_ring_setup(void);
@@ -252,6 +253,14 @@ int eco_root(const char *name) {
     return open(name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
+static int path_open_error(int dir, const char *name) {
+    if (errno == ELOOP) return ECO_PATH_LINK_BLOCKED;
+    struct stat st;
+    if (errno == ENOTDIR && fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode))
+        return ECO_PATH_LINK_BLOCKED;
+    return -1;
+}
+
 // Walk relative paths with directory handles and forbid symlinks at every level.
 int eco_parent(int root, const char *path, char *leaf, int capacity) {
     int dir = fcntl(root, F_DUPFD_CLOEXEC, 3);
@@ -265,8 +274,9 @@ int eco_parent(int root, const char *path, char *leaf, int capacity) {
         leaf[n] = '\0';
         if (!p[n]) return dir;
         int next = openat(dir, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0) next = path_open_error(dir, leaf);
         close(dir);
-        if (next < 0) return -1;
+        if (next < 0) return next;
         dir = next;
         p += n + 1;
     }
@@ -277,7 +287,7 @@ int eco_parent(int root, const char *path, char *leaf, int capacity) {
 int eco_open(int dir, const char *leaf, int want_dir) {
     int flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
     int fd = openat(dir, leaf, flags | (want_dir ? O_DIRECTORY : 0));
-    if (fd < 0) return -1;
+    if (fd < 0) return path_open_error(dir, leaf);
     struct stat st;
     if (fstat(fd, &st) < 0 || (!want_dir && !S_ISREG(st.st_mode))) {
         close(fd);
