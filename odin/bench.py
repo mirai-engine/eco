@@ -52,7 +52,7 @@ def main():
         server_key = cli("keygen", server_secret).stdout.decode().strip()
         client_key = cli("keygen", client_secret).stdout.decode().strip()
         clients = base / "clients"
-        clients.write_text(client_key + "\n")
+        cli("trust", "add", clients, client_key, "bench")
         target = endpoint(port_for())
         path = base / "s"
         env = {**os.environ, "ECO_SOCKET": str(path)}

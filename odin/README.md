@@ -4,15 +4,16 @@ ECO's Odin implementation uses a fixed `Noise_IK_25519_ChaChaPoly_BLAKE2s` suite
 X25519 public keys. The local CLI talks to a small daemon over an owner-only Unix socket. The daemon
 shares an authenticated UDP session across independent command, terminal, file and tunnel streams.
 When the session rotates, streams on the previous session continue to receive keepalives.
-The wire protocol uses binary records, and file transfers use BLAKE3.
+The wire protocol uses binary records marked `ECO3`, and file transfers use BLAKE3. A
+protocol change that breaks the wire format bumps the marker; peers of different versions do not
+interoperate.
 
 ## Build and pair
 
 The verified builds are macOS arm64 and Ubuntu 24.04 Linux arm64. Build with Odin containing
-`core:crypto/noise` (tested with `dev-2026-10`), a C toolchain and Git. The script fetches pinned KCP
-and odin-blake3 sources. On Linux, `pkg-config` and liburing development headers enable the optional
-io_uring backend. On both platforms, `pkg-config` and libcrypto development headers enable bulk
-AES-GCM acceleration.
+`core:crypto/noise` and `core:crypto/aegis` (tested with `dev-2026-10`), a C toolchain and Git. The
+script fetches pinned KCP and odin-blake3 sources. On Linux, `pkg-config` and liburing development
+headers enable the optional io_uring backend. All cryptography is Odin's; nothing links OpenSSL.
 
 macOS uses poll for small descriptor sets and kqueue as they grow. Linux uses the same small-set
 poll path and can use io_uring for larger sets when the kernel permits it. Set
@@ -27,10 +28,9 @@ bin/eco keygen server.key  # run on the server machine
 bin/eco keygen client.key  # run on the client machine
 ```
 
-Leave the private files on their respective machines. The server accepts the clients listed in a
-`CLIENTS` file, one public key per line followed by an optional label; it reads the file on every
-handshake, so deleting a line revokes that client for its next session. Pairing fills both sides
-without copying keys:
+Leave the private files on their respective machines. The server accepts the clients in its
+`CLIENTS` trust store, which it reads on every handshake, so a revocation applies to the client's
+next session. Pairing fills both sides without copying keys:
 
 ```sh
 # Server, with native read/write, command execution, PTY and forwarding enabled
@@ -45,18 +45,38 @@ bin/eco pair "$ECO_ADDR" laptop
 bin/eco ping
 ```
 
-Both screens show the same verification code, for example `0346-9283`. It is derived from the
-transcript of a `Noise_XX` handshake, which binds both static keys, so a machine in the middle
-makes the two codes differ. A running server always accepts requests and asks its operator: on
+Both screens show the same verification code, for example `0346-9283`. Pairing runs a
+`Noise_XX` handshake in which the client first commits to its static key and a fresh nonce, and
+opens the commitment only after the server has sent its own nonce; the server rejects a client
+whose opening does not match before it shows a code. The code hashes both ephemeral keys, both
+static keys and both nonces, and nothing a sender can choose after seeing the other side's nonce,
+such as the names either side shows. A machine in the middle must fix its half of each code before
+it learns the nonce that completes it, so it matches the two screens with probability 10⁻⁸ per
+attempt. A running server always accepts requests and asks its operator: on
 Windows and macOS a dialog in the operator's session shows the client's name, address and code,
 with No as the default; on Linux the server's terminal asks `y` or `n`. A request expires after
-five minutes. On approval the server appends the client to `CLIENTS` and the client stores the
-server key under its address in `ECO_HOME/known_servers` (`~/.eco` by default), which
+five minutes. On approval the server adds the client to `CLIENTS` and the client stores the
+server key under its address in the `ECO_HOME/servers` trust store (`~/.eco` by default), which
 later commands use for that `ECO_ADDR`; `ECO_PEER` pins a key instead.
 
 Any machine that reaches the port can raise a request, so approve only one you expect and whose
 code matches. The server handles one request at a time and, after five denied or expired requests
-in a row, ignores new ones for ten minutes. The code has 8 digits.
+in a row, ignores new ones for ten minutes. A client that does not open its commitment counts as a
+denial. The code has 8 digits.
+
+### Trust stores
+
+`CLIENTS` and `ECO_HOME/servers` are binary trust stores. Each entry holds a public key, a label, the
+time it was added, an optional expiry and a revoked flag; a BLAKE3 digest covers the whole file, and
+a store that is malformed, truncated or of another version authorizes nothing. Every change writes
+a private temporary file, syncs it and renames it over the store. A key lookup compares every entry
+in constant time.
+
+```sh
+eco trust add clients CLIENT_PUBLIC laptop        # optional lifetime in seconds after the label
+eco trust revoke clients CLIENT_PUBLIC
+eco trust list clients                            # key, label, added, expiry, state
+```
 
 The client starts its daemon on demand and exits it after two minutes without local calls.
 Alternatively, run `eco client SOCKET UDP KEY PEER` in the foreground. Use a separate
@@ -111,10 +131,10 @@ Set `ECO_BULK_TCP=1` on both machines to send `put` and `get` over a separate TC
 on the same numeric port. The bulk client uses `ECO_ADDR`, `ECO_KEY`, `ECO_PEER`
 and, when required, `ECO_CAPABILITY`. The Noise IK handshake uses a distinct prologue, and
 a transport-encrypted confirmation carries fresh keying material. HKDF-SHA256 binds it to the
-Noise transcript, and separate AES-256-GCM keys authenticate the two record directions. The
-server starts a transfer worker only after it verifies that confirmation. Libcrypto loads on
-demand when available. `ECO_BULK_CRYPTO=portable` selects the wire-compatible Odin AES
-implementation. Each bulk connection is bounded to 2²² records per direction.
+Noise transcript, and separate AEGIS-256 keys authenticate the two record directions, with the
+record counter as the nonce. Odin's AEGIS uses the CPU's AES instructions where present and a
+constant-time portable implementation elsewhere. The server starts a transfer worker only after it
+verifies that confirmation.
 
 The remote target of a forward is a numeric IP and port as seen by the server. TCP forwarding
 bridges two TCP connections over a KCP stream and preserves half-close. UDP forwarding preserves
@@ -179,7 +199,7 @@ concatenated JPEGs, defaults to 4 FPS, and accepts a capture rate from 1 to 10 F
 may run per host and Ctrl-C cancels it. Video is paced at up to four datagrams per 10 ms after
 reliable traffic has been serviced.
 
-A video datagram is an authenticated ECO2 record in the existing Noise session. Its plaintext
+A video datagram is an authenticated ECO3 record in the existing Noise session. Its plaintext
 starts with the stream ID (`u32`), frame ID (`u32`), zero-based chunk index (`u16`) and chunk count
 (`u16`), all little-endian. Each chunk holds up to 1,148 bytes of a JPEG, for at most 1,200 bytes of
 UDP payload including ECO and Noise overhead. The JPEG is capped at 256 KiB. The receiver accepts

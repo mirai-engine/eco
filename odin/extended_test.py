@@ -384,8 +384,7 @@ def test_bulk(base, root, server_secret, server_key, client_secret, client_key, 
         wrong = {**settings, "ECO_KEY": str(wrong_client)}
         assert cli("put", source, "wrong", env=wrong, check=False).returncode
         assert not (root / "wrong").exists()
-    portable = {**settings, "ECO_BULK_CRYPTO": "portable"}
-    with background("serve", target, server_secret, base / "clients", root, "read", env=portable) as server:
+    with background("serve", target, server_secret, base / "clients", root, "read", env=settings) as server:
         ready = server.stderr.readline()
         assert b"listening" in ready, ready
         assert cli("put", source, "read-only", env=settings, check=False).returncode
@@ -441,7 +440,7 @@ def main():
         server_secret, client_secret = base / "server", base / "client"
         server_key = cli("keygen", server_secret).stdout.decode().strip()
         client_key = cli("keygen", client_secret).stdout.decode().strip()
-        (base / "clients").write_text(client_key + "\n")
+        cli("trust", "add", base / "clients", client_key, "test")
         port, local = port_for(), base / "s"
         env = {**os.environ, "ECO_SOCKET": str(local), "ECO_JOBS": str(jobs), "TEST_ROOT": str(root)}
         with ExitStack() as stack:

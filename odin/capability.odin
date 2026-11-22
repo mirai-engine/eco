@@ -11,7 +11,7 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 
-CAP_DOMAIN :: "ECO2 capability v1"
+CAP_DOMAIN :: "ECO3 capability"
 CAP_PREFIX :: 76
 CAP_MAX_PATH :: 160
 CAP_MAX :: CAP_PREFIX+CAP_MAX_PATH+ed25519.SIGNATURE_SIZE
@@ -55,8 +55,9 @@ create_seed :: proc(path: string, bytes: []byte) -> bool {
     file, err := os.open(path, {.Write, .Create, .Excl}, {.Read_User, .Write_User})
     if err != nil { return false }
     n, write_err := os.write(file, bytes)
+    sync_err := os.sync(file)
     close_err := os.close(file)
-    if n != len(bytes) || write_err != nil || close_err != nil {
+    if n != len(bytes) || write_err != nil || sync_err != nil || close_err != nil {
         _ = os.remove(path)
         return false
     }

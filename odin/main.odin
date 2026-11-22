@@ -16,8 +16,9 @@ import "deps:blake3"
 USAGE :: `usage: eco COMMAND
   keygen KEY                         create a 0600 X25519 key and print its public key
   serve UDP KEY CLIENTS ROOT [read|write|run|tunnel] [ISSUER_PUBLIC_KEY]
-                                     CLIENTS lists authorized client keys; approved pairings add to it
+                                     CLIENTS is the trust store of client keys; approved pairings add to it
   pair UDP [NAME]                    pair with a server using ECO_KEY; its operator approves
+  trust add STORE PUBLIC_KEY [LABEL [TTL_SECONDS]] | revoke STORE PUBLIC_KEY | list STORE
   issuer-keygen KEY
   grant ISSUER_KEY SERVER_KEY CLIENT_KEY RWXT TTL_SECONDS PATH
   client SOCKET UDP KEY PEER         keep a client daemon in the foreground
@@ -37,7 +38,7 @@ USAGE :: `usage: eco COMMAND
   tty [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
 
 Client environment: ECO_SOCKET, ECO_ADDR, ECO_KEY, ECO_HOME and, unless pair
-stored the server for ECO_ADDR in ECO_HOME/known_servers, ECO_PEER.
+stored the server for ECO_ADDR in the ECO_HOME/servers trust store, ECO_PEER.
 Paths sent to the server are relative to ROOT. Peer keys are 64 hex characters.
 `
 
@@ -504,8 +505,9 @@ main :: proc() {
         os.exit(dispatch_platform(args))
     case "pair":
         if len(args) != 2 && len(args) != 3 { os.exit(error_exit(USAGE)) }
-        name := args[2] if len(args) == 3 else os.get_env("COMPUTERNAME" when ODIN_OS == .Windows else "HOSTNAME", context.temp_allocator)
-        os.exit(pair_client(args[1], name))
+        os.exit(pair_client(args[1], args[2] if len(args) == 3 else machine_name()))
+    case "trust":
+        os.exit(trust_cli(args[1:]))
     case:
         os.exit(command_cli(args))
     }

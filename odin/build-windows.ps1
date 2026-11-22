@@ -32,7 +32,7 @@ try {
     Get-Dependency kcp 'https://github.com/skywind3000/kcp.git' 'b1a7a2101dcbb96017681a500d6b82bbe5a88766'
     $Objects = @()
     foreach ($Source in @('odin/platform_windows_io.c', 'odin/platform_windows_fs.c',
-                          'odin/platform_windows_process.c', 'odin/platform_crypto.c', '.eco-deps/kcp/ikcp.c')) {
+                          'odin/platform_windows_process.c', '.eco-deps/kcp/ikcp.c')) {
         $Stem = [IO.Path]::GetFileNameWithoutExtension($Source)
         $Object = ".eco-deps/windows_amd64/$Stem.obj"
         Invoke-Checked cl.exe @('/nologo', '/O2', '/MT', '/std:c11', '/D_CRT_SECURE_NO_WARNINGS',

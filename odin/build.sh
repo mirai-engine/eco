@@ -45,16 +45,8 @@ if [ "$(uname -s)" = Linux ]; then
     fi
 fi
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 $linux_flags -c odin/platform_linux.c -o .eco-deps/platform_linux.o
-if command -v pkg-config >/dev/null && pkg-config --exists libcrypto; then
-    crypto_dir=$(pkg-config --variable=libdir libcrypto)
-    crypto_name=libcrypto.so
-    if [ "$(uname -s)" = Darwin ]; then crypto_name=libcrypto.dylib; fi
-    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 $(pkg-config --cflags libcrypto) \
-        "-DECO_LIBCRYPTO=\"$crypto_dir/$crypto_name\"" -c odin/platform_crypto.c -o .eco-deps/platform_crypto.o
-else
-    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 -c odin/platform_crypto.c -o .eco-deps/platform_crypto.o
-fi
-ar rcs .eco-deps/libeco_platform.a .eco-deps/ikcp.o .eco-deps/platform.o .eco-deps/platform_linux.o .eco-deps/platform_crypto.o
+rm -f .eco-deps/libeco_platform.a
+ar rcs .eco-deps/libeco_platform.a .eco-deps/ikcp.o .eco-deps/platform.o .eco-deps/platform_linux.o
 
 lock_flags="-collection:deps=$PWD/.eco-deps"
 if [ "${1:-}" = test ]; then

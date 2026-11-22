@@ -72,6 +72,8 @@ foreign platform {
     ikcp_waitsnd :: proc(kcp: rawptr) -> c.int ---
 }
 
+// Every datagram starts with this marker; an incompatible protocol change bumps its number.
+PROTOCOL_MARKER :: "ECO3"
 NOISE_SUITE :: "Noise_IK_25519_ChaChaPoly_BLAKE2s"
 HEADER_SIZE :: 24
 HELLO_OVERHEAD :: 96
@@ -169,7 +171,7 @@ put_u64 :: proc(data: []byte, value: u64) {
 }
 
 write_header :: proc(dst: []byte, kind: Packet_Kind, id, nonce: u64) {
-    copy(dst, "ECO2")
+    copy(dst, PROTOCOL_MARKER)
     dst[4] = u8(kind)
     dst[5], dst[6], dst[7] = 0, 0, 0
     put_u64(dst[8:], id)
@@ -177,7 +179,7 @@ write_header :: proc(dst: []byte, kind: Packet_Kind, id, nonce: u64) {
 }
 
 parse_header :: proc(data: []byte) -> (Record, bool) {
-    if len(data) <= HEADER_SIZE || len(data) > MAX_PACKET || string(data[:4]) != "ECO2" ||
+    if len(data) <= HEADER_SIZE || len(data) > MAX_PACKET || string(data[:4]) != PROTOCOL_MARKER ||
        data[5] | data[6] | data[7] != 0 {
         return {}, false
     }
@@ -351,10 +353,10 @@ accept_link :: proc(udp: net.UDP_Socket, from: net.Endpoint, packet: []byte, hea
     if noise.handshake_init(&handshake, false, packet[:16], own, nil, NOISE_SUITE) != .Ok { return nil }
     decoded: [1+CAP_MAX]byte
     early, status := noise.handshake_read_message(&handshake, packet[HEADER_SIZE:], decoded[:])
-    if status != .Handshake_Pending || len(early) == 0 || early[0] > 1 ||
-       !client_authorized(clients, &handshake.rs) {
-        return nil
-    }
+    if status != .Handshake_Pending || len(early) == 0 || early[0] > 1 { return nil }
+    client: [32]byte
+    ecdh.public_key_bytes(&handshake.rs, client[:])
+    if !trust_permits(clients, client[:]) { return nil }
     grant, permitted := verify_capability(policy, &handshake.rs, early[1:])
     if !permitted { return nil }
     scope := open_scope(root, grant)
@@ -364,7 +366,7 @@ accept_link :: proc(udp: net.UDP_Socket, from: net.Endpoint, packet: []byte, hea
     link.confined = grant.scope != "." && grant.mask & CAP_RUN != 0
     if link.confined { link.scope_key = scope_key(grant.scope) }
     link.id, link.udp, link.remote = header.id, udp, from
-    ecdh.public_key_bytes(&handshake.rs, link.client_key[:])
+    link.client_key = client
     link.hello_len = copy(link.client_hello[:], packet)
     write_header(link.server_hello[:], .Welcome, header.id, 0)
     reply, result := noise.handshake_write_message(&handshake, early[:1], link.server_hello[HEADER_SIZE:])

@@ -107,7 +107,7 @@ def main():
 
         server_key = cli("keygen", base / "server.key").stdout.decode().strip()
         client_key = cli("keygen", base / "client.key").stdout.decode().strip()
-        (base / "clients").write_text(client_key + "\n")
+        cli("trust", "add", base / "clients", client_key, "desktop")
         port = port_for()
         sock = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         sock.bind(("127.0.0.1", 0))

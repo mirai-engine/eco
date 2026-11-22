@@ -21,7 +21,7 @@ Access :: enum { Read, Write, Run, Tunnel }
 Server :: struct {
     udp: net.UDP_Socket,
     own: ecdh.Private_Key,
-    // File of authorized client keys, read on every handshake so a removed line revokes at once.
+    // Trust store of client keys, read on every handshake so a revocation applies at once.
     clients: string,
     pairing: ^Pairing,
     access: Access,
@@ -646,6 +646,7 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
     // Not freed: approval threads may still post answers into it until the process exits.
     server.pairing = new(Pairing)
     if server.pairing == nil { return error_exit("out of memory") }
+    server.pairing.name_len = clean_label(transmute([]byte)machine_name(), server.pairing.name[:], "server")
     defer reset_pairing(server.pairing)
     when ODIN_OS == .Linux {
         if !start_pair_console(server.pairing) { return error_exit("cannot read pairing answers from the console") }

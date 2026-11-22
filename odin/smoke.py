@@ -70,7 +70,7 @@ def main():
         server_key = cli("keygen", server_secret).stdout.decode().strip()
         client_key = cli("keygen", client_secret).stdout.decode().strip()
         clients = keys / "clients"
-        clients.write_text(client_key + "\n")
+        cli("trust", "add", clients, client_key, "smoke")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
             reserve.bind(("127.0.0.1", 0))
             port = reserve.getsockname()[1]
@@ -83,8 +83,20 @@ def main():
             assert server.stderr.readline().startswith(b"eco listening")
             assert cli("ping-early", address, client_secret, server_key).stdout.startswith(b"pong")
             stranger = keys / "stranger"
-            cli("keygen", stranger)
+            stranger_key = cli("keygen", stranger).stdout.decode().strip()
             assert cli("ping-early", address, stranger, server_key, check=False).returncode
+            cli("trust", "add", clients, stranger_key, "stranger", "3600")
+            assert cli("ping-early", address, stranger, server_key).stdout.startswith(b"pong")
+            listed = cli("trust", "list", clients).stdout.decode().splitlines()
+            assert [line.split("\t")[1] for line in listed] == ["smoke", "stranger"], listed
+            assert listed[1].split("\t")[4] == "active" and int(listed[1].split("\t")[3]) > 0, listed
+            cli("trust", "revoke", clients, stranger_key)
+            assert cli("ping-early", address, stranger, server_key, check=False).returncode
+            assert cli("trust", "list", clients).stdout.decode().splitlines()[1].endswith("\trevoked")
+            # A text list of keys is not a trust store and authorizes nothing.
+            text_store = keys / "text-clients"
+            text_store.write_text(client_key + "\n")
+            assert cli("trust", "list", text_store, check=False).returncode
             with background("client", local_socket, address, client_secret, server_key) as client:
                 deadline = time.monotonic() + 4
                 while not local_socket.exists() and time.monotonic() < deadline and client.poll() is None:

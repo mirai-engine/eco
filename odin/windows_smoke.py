@@ -220,7 +220,7 @@ def check_pairing(binary, base, run, root):
         client = subprocess.Popen([binary, "pair", address, "laptop"], env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         logged = server_line("pairing request from laptop")
-        code = client.stdout.readline().decode().removeprefix("verification code ").split(";")[0]
+        code = client.stdout.readline().decode().split()[2]
         assert logged.rstrip().endswith(f"with code {code}"), (logged, code)
         # The dialog's title carries the server's code, so finding it proves both codes match.
         title, deadline = f"eco pairing {code}", time.monotonic() + 10
@@ -240,12 +240,12 @@ def check_pairing(binary, base, run, root):
         status, output, error = request(IDYES)
         assert status == 0, error
         assert server_public.encode() in output, output
-        assert clients.read_text().split()[0] == client_public
-        assert (home / "known_servers").read_text().split() == [address, server_public]
+        assert run("trust", "list", clients).stdout.decode().split("\t")[:2] == [client_public, "laptop"]
+        assert run("trust", "list", home / "servers").stdout.decode().split("\t")[:2] == [server_public, address]
         assert run("ping", env=env).stdout.startswith(b"pong")
         assert run("stat", ".", env=env).stdout.startswith(b"directory")
         stop_test_daemon(env["ECO_SOCKET"])
-        clients.write_text("")  # Revocation applies to the next handshake.
+        run("trust", "revoke", clients, client_public)  # Revocation applies to the next handshake.
         assert run("ping-early", address, client_key, server_public, env=env, checked=False).returncode != 0
     finally:
         server.terminate()
@@ -313,7 +313,7 @@ def main():
         env.pop("ECO_BULK_TCP", None)
         bulk = {**env, "ECO_BULK_TCP": "1"}
         clients = base / "clients"
-        clients.write_text(client_public + " smoke\n")
+        run("trust", "add", clients, client_public, "smoke")
         server_args = ("serve", address, server_key, clients, root, "run")
         client_args = ("client", pipe, address, client_key, server_public)
         with background(*server_args, directory=base, env=bulk):

@@ -1,29 +1,15 @@
 package eco
 
-import "core:c"
 import "core:crypto"
-import "core:crypto/aes"
+import "core:crypto/aegis"
 import "core:crypto/hkdf"
-import "core:os"
 
-when ODIN_OS == .Windows {
-    foreign import platform "../.eco-deps/eco_platform.lib"
-} else {
-    foreign import platform "../.eco-deps/libeco_platform.a"
-}
-@(default_calling_convention="c")
-foreign platform {
-    eco_aes_context :: proc(key: ^byte, encrypt: c.int) -> rawptr ---
-    eco_aes_free :: proc(ctx: rawptr) ---
-    eco_aes_record :: proc(ctx, nonce, aad: rawptr, aad_len: c.int, text: rawptr,
-                            count: c.int, tag: rawptr, encrypt: c.int) -> c.int ---
-}
+BULK_TAG :: aegis.TAG_SIZE_128
 
-BULK_RECORD_LIMIT :: 1 << 22
-
+// Each direction has its own AEGIS-256 key; the record counter is the nonce, so a key never
+// seals two records under one nonce.
 Bulk_Key :: struct {
-    accelerator: rawptr,
-    portable: aes.Context_GCM,
+    aead: aegis.Context,
     counter: u64,
 }
 
@@ -32,39 +18,30 @@ Bulk_Cipher :: struct {
 }
 
 bulk_cipher_init :: proc(cipher: ^Bulk_Cipher, transcript, seed: []byte, initiator: bool) {
-    material: [64]byte
+    material: [2*aegis.KEY_SIZE_256]byte
     defer crypto.zero_explicit(&material, len(material))
-    label: string = "ECO2 bulk AES-256-GCM client-to-server then server-to-client"
+    label: string = "ECO3 bulk AEGIS-256 client-to-server then server-to-client"
     hkdf.extract_and_expand(.SHA256, transcript, seed, transmute([]byte)label, material[:])
-    sender, receiver := material[:32], material[32:]
+    sender, receiver := material[:aegis.KEY_SIZE_256], material[aegis.KEY_SIZE_256:]
     if !initiator { sender, receiver = receiver, sender }
-    env: [64]byte
-    if os.get_env(env[:], "ECO_BULK_CRYPTO") != "portable" {
-        cipher.send.accelerator = eco_aes_context(&sender[0], 1)
-        cipher.receive.accelerator = eco_aes_context(&receiver[0], 0)
-    }
-    if cipher.send.accelerator == nil { aes.init_gcm(&cipher.send.portable, sender) }
-    if cipher.receive.accelerator == nil { aes.init_gcm(&cipher.receive.portable, receiver) }
+    aegis.init(&cipher.send.aead, sender)
+    aegis.init(&cipher.receive.aead, receiver)
 }
 
 bulk_cipher_free :: proc(cipher: ^Bulk_Cipher) {
-    eco_aes_free(cipher.send.accelerator)
-    eco_aes_free(cipher.receive.accelerator)
+    aegis.reset(&cipher.send.aead)
+    aegis.reset(&cipher.receive.aead)
     crypto.zero_explicit(cipher, size_of(Bulk_Cipher))
 }
 
 bulk_crypt :: proc(key: ^Bulk_Key, aad, text, tag: []byte, encrypt: bool) -> bool {
-    if key.counter >= BULK_RECORD_LIMIT { return false }
-    nonce: [12]byte
-    put_u64(nonce[4:], key.counter)
+    if key.counter == max(u64) { return false }
+    nonce: [aegis.IV_SIZE_256]byte
+    put_u64(nonce[:], key.counter)
     key.counter += 1
-    if key.accelerator != nil {
-        return eco_aes_record(key.accelerator, &nonce[0], raw_data(aad), c.int(len(aad)),
-                              raw_data(text), c.int(len(text)), raw_data(tag), c.int(encrypt)) == 1
-    }
     if encrypt {
-        aes.seal_gcm(&key.portable, text, tag, nonce[:], aad, text)
+        aegis.seal(&key.aead, text, tag, nonce[:], aad, text)
         return true
     }
-    return aes.open_gcm(&key.portable, text, nonce[:], aad, text, tag)
+    return aegis.open(&key.aead, text, nonce[:], aad, text, tag)
 }

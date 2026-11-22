@@ -140,7 +140,7 @@ def main():
         base = Path(tmp)
         server_key = cli("keygen", base/"eco-server").stdout.decode().strip()
         client_key = cli("keygen", base/"eco-client").stdout.decode().strip()
-        (base/"eco-clients").write_text(client_key + "\n")
+        cli("trust", "add", base/"eco-clients", client_key, "compare")
         local = base/"eco.sock"
         target = endpoint(port_for())
         env = {**os.environ, "ECO_SOCKET": str(local), "ECO_ADDR": target,

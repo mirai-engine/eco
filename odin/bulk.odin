@@ -23,9 +23,9 @@ foreign platform {
     eco_bulk_worker :: proc(socket, scope: c.int) -> c.int ---
 }
 
-BULK_PROLOGUE :: string("ECO2 file transfer v2")
+BULK_PROLOGUE :: string("ECO3 file transfer")
 BULK_DATA :: 64*1024 - 32
-BULK_CAPACITY :: BULK_DATA + 3 + noise.TAG_SIZE
+BULK_CAPACITY :: BULK_DATA + 3 + BULK_TAG
 BULK_PEERS :: 8
 
 Bulk_Pending :: struct {
@@ -96,10 +96,10 @@ bulk_plain_read :: proc(fd: c.int, buffer: []byte) -> []byte {
 bulk_send :: proc(fd: c.int, cipher: ^Bulk_Cipher, buffer: []byte, op: Op, data: []byte = nil) -> bool {
     if len(data) > BULK_DATA { return false }
     size := 1+len(data)
-    bulk_header(buffer[:2], size+noise.TAG_SIZE)
+    bulk_header(buffer[:2], size+BULK_TAG)
     buffer[2] = byte(op)
     copy(buffer[3:], data)
-    end := 2+size+noise.TAG_SIZE
+    end := 2+size+BULK_TAG
     return bulk_crypt(&cipher.send, buffer[:2], buffer[2:2+size], buffer[2+size:end], true) &&
            write_fd(fd, buffer[:end])
 }
@@ -107,8 +107,8 @@ bulk_send :: proc(fd: c.int, cipher: ^Bulk_Cipher, buffer: []byte, op: Op, data:
 bulk_receive :: proc(fd: c.int, cipher: ^Bulk_Cipher, buffer: []byte) -> []byte {
     if !read_fully(fd, buffer[:2]) { return nil }
     size := bulk_length(buffer[:2])
-    if size <= noise.TAG_SIZE || size > len(buffer)-2 || !read_fully(fd, buffer[2:2+size]) { return nil }
-    plain := buffer[2:2+size-noise.TAG_SIZE]
+    if size <= BULK_TAG || size > len(buffer)-2 || !read_fully(fd, buffer[2:2+size]) { return nil }
+    plain := buffer[2:2+size-BULK_TAG]
     valid := bulk_crypt(&cipher.receive, buffer[:2], plain, buffer[2+len(plain):2+size], false)
     return plain if valid else nil
 }
@@ -211,7 +211,10 @@ bulk_accept_hello :: proc(server: ^Server, p: ^Bulk_Pending, hello: []byte) -> b
     if noise.handshake_init(&handshake, false, protocol, &server.own, nil, NOISE_SUITE) != .Ok { return false }
     token: [CAP_MAX]byte
     payload, status := noise.handshake_read_message(&handshake, hello, token[:])
-    if status != .Handshake_Pending || !client_authorized(server.clients, &handshake.rs) { return false }
+    if status != .Handshake_Pending { return false }
+    client: [32]byte
+    ecdh.public_key_bytes(&handshake.rs, client[:])
+    if !trust_permits(server.clients, client[:]) { return false }
     grant, valid := verify_capability(&server.policy, &handshake.rs, payload)
     if !valid { return false }
     p.scope = open_scope(server.root, grant)
