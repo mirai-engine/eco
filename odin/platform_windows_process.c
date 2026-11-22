@@ -145,8 +145,11 @@ static HANDLE create_process(char *const args[], const wchar_t *directory, HANDL
 
     HANDLE job = NULL;
     if (ok && job_out) {
+        // Kills the tree when the command ends, except a process created with
+        // CREATE_BREAKAWAY_FROM_JOB, which asked to outlive it (a detached server or editor).
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit = {0};
-        limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                                                 JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         job = CreateJobObjectW(NULL, NULL);
         ok = job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limit, sizeof(limit));
     }
@@ -306,8 +309,14 @@ void eco_terminal_restore(void) {
 
 static HANDLE detached(char *const args[]) {
     HANDLE handles[3] = {null_file(GENERIC_READ), null_file(GENERIC_WRITE), null_file(GENERIC_WRITE)};
-    HANDLE process = handles[0] && handles[1] && handles[2] ?
-        create_process(args, NULL, handles, NULL, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, NULL) : NULL;
+    HANDLE process = NULL;
+    if (handles[0] && handles[1] && handles[2]) {
+        // Leave a job this process runs in, so that the job's end does not end it; a job that
+        // forbids breakaway rejects the request and keeps the process.
+        const DWORD flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        process = create_process(args, NULL, handles, NULL, flags | CREATE_BREAKAWAY_FROM_JOB, NULL);
+        if (!process) process = create_process(args, NULL, handles, NULL, flags, NULL);
+    }
     close_handles(handles);
     return process;
 }

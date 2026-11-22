@@ -46,7 +46,8 @@ int eco_spawn_pipe(BOOL host_reads, int *host_fd, HANDLE *child);
 int eco_close(int fd);
 wchar_t *eco_wide(const char *text);
 wchar_t *eco_working_directory(HANDLE handle);
-int eco_pipe_security(SECURITY_ATTRIBUTES *security, PSECURITY_DESCRIPTOR *descriptor);
+int eco_private_security(SECURITY_ATTRIBUTES *security, PSECURITY_DESCRIPTOR *descriptor,
+                         BOOL container);
 BOOL eco_private_owner(HANDLE handle, BOOL check_permissions);
 void eco_post_wakeup(void);
 void CALLBACK eco_wait_callback(PVOID port, BOOLEAN timed_out);

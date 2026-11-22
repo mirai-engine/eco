@@ -2,7 +2,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import csv
 import ctypes
 from ctypes import wintypes
 import msvcrt
@@ -191,6 +190,26 @@ def check_tunnels(background, base, env):
                 expected.result(timeout=2)
 
 
+def check_breakaway(run, base, env):
+    # A grandchild that asks to break away from the job outlives `run`; an ordinary one ends
+    # with the command, as the session start of an editor and a stray helper do.
+    detached, attached = base / "detached-alive", base / "attached-alive"
+    later = "import sys,time;time.sleep(2);open(sys.argv[1],'w').close()"
+    script = ("import subprocess as s,sys;"
+              "quiet=dict(stdin=s.DEVNULL,stdout=s.DEVNULL,stderr=s.DEVNULL);"
+              f"s.Popen([sys.executable,'-c',{later!r},sys.argv[1]],"
+              "creationflags=s.CREATE_BREAKAWAY_FROM_JOB|s.DETACHED_PROCESS,**quiet);"
+              f"s.Popen([sys.executable,'-c',{later!r},sys.argv[2]],"
+              "creationflags=s.CREATE_NO_WINDOW,**quiet)")
+    run("run", "--", sys.executable, "-c", script, detached, attached, env=env)
+    deadline = time.monotonic() + 8
+    while not detached.exists():
+        assert time.monotonic() < deadline, "a process that broke away did not outlive run"
+        time.sleep(0.05)
+    time.sleep(1)
+    assert not attached.exists(), "an ordinary child outlived run"
+
+
 def check_pairing(binary, base, run, root):
     home, server_key, client_key = base / "pair-home", base / "pair-server.key", base / "pair-client.key"
     home.mkdir()
@@ -284,18 +303,13 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="eco-win-") as folder:
         base = Path(folder)
-        root, jobs = base / "remote-é", base / "jobs"
+        root, home = base / "remote-é", base / "home"
         root.mkdir()
         nested = root / "nested directory"
         nested.mkdir()
-        jobs.mkdir()
         outside = base / "outside"
         outside.mkdir()
         (outside / "outside.txt").write_bytes(b"outside the scope")
-        sid = next(csv.reader(subprocess.check_output(
-            ["whoami", "/user", "/fo", "csv", "/nh"], text=True).splitlines()))[1]
-        subprocess.run(["icacls", str(jobs), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
-                       capture_output=True, check=True)
 
         server_key = base / "server.key"
         client_key = base / "client.key"
@@ -306,11 +320,11 @@ def main():
             port = reserve.getsockname()[1]
         address = f"127.0.0.1:{port}"
         pipe = r"\\.\pipe\eco-win-test-" + uuid.uuid4().hex
+        # Without ECO_JOBS the server keeps jobs in a private ECO_HOME/jobs that it creates.
         env = {**os.environ, "ECO_SOCKET": pipe, "ECO_ADDR": address,
-               "ECO_KEY": str(client_key), "ECO_PEER": server_public,
-               "ECO_JOBS": str(jobs)}
-        env.pop("ECO_CAPABILITY", None)
-        env.pop("ECO_BULK_TCP", None)
+               "ECO_KEY": str(client_key), "ECO_PEER": server_public, "ECO_HOME": str(home)}
+        for name in ("ECO_CAPABILITY", "ECO_BULK_TCP", "ECO_JOBS"):
+            env.pop(name, None)
         bulk = {**env, "ECO_BULK_TCP": "1"}
         clients = base / "clients"
         run("trust", "add", clients, client_public, "smoke")
@@ -382,6 +396,7 @@ def main():
                                pool.map(lambda _: run("ping", env=env), range(8)))
                 check_pty(pipe)
                 check_tunnels(background, base, env)
+                check_breakaway(run, base, env)
 
                 job = run("start", "--", sys.executable, "-c",
                           "import time;print('before',flush=True);time.sleep(2);print('after',flush=True)",

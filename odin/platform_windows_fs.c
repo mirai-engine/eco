@@ -303,7 +303,7 @@ int eco_ensure_private_dir(const char *name) {
     if (!wide) return 0;
     SECURITY_ATTRIBUTES security;
     PSECURITY_DESCRIPTOR descriptor;
-    if (eco_pipe_security(&security, &descriptor) < 0) { free(wide); return 0; }
+    if (eco_private_security(&security, &descriptor, TRUE) < 0) { free(wide); return 0; }
     CreateDirectoryW(wide, &security);
     LocalFree(descriptor);
     free(wide);
@@ -315,7 +315,7 @@ int eco_lock_local(const char *name) {
     if (!wide) return -1;
     SECURITY_ATTRIBUTES security;
     PSECURITY_DESCRIPTOR descriptor;
-    if (eco_pipe_security(&security, &descriptor) < 0) { free(wide); return -1; }
+    if (eco_private_security(&security, &descriptor, FALSE) < 0) { free(wide); return -1; }
     HANDLE file = valid_handle(CreateFileW(wide, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
                                 0, &security, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL), 0, NULL);
     LocalFree(descriptor);
@@ -339,7 +339,7 @@ int eco_safe_private_file(const char *name) {
 int eco_make_private(const char *name, const void *buffer, int length) {
     SECURITY_ATTRIBUTES security;
     PSECURITY_DESCRIPTOR descriptor;
-    if (eco_pipe_security(&security, &descriptor) < 0) return -1;
+    if (eco_private_security(&security, &descriptor, FALSE) < 0) return -1;
     HANDLE file = local_handle(name, GENERIC_WRITE | DELETE, CREATE_NEW, &security, 0);
     LocalFree(descriptor);
     if (file == INVALID_HANDLE_VALUE) return -1;

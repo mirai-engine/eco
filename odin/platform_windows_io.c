@@ -482,11 +482,15 @@ int eco_default_pipe(char *out, int capacity) {
     return n > 0 && n < capacity ? n : -1;
 }
 
-int eco_pipe_security(SECURITY_ATTRIBUTES *security, PSECURITY_DESCRIPTOR *descriptor) {
+int eco_private_security(SECURITY_ATTRIBUTES *security, PSECURITY_DESCRIPTOR *descriptor,
+                         BOOL container) {
     wchar_t *sid = NULL;
     if (!token_sid(&sid)) return -1;
+    // A container passes its ACL on: without inheritable entries, what is created inside it
+    // gets the token's default DACL, which also grants the logon session.
+    const wchar_t *inherit = container ? L"OICI" : L"";
     wchar_t sddl[384];
-    int n = swprintf(sddl, 384, L"O:%lsD:P(A;;GA;;;%ls)(A;;GA;;;SY)", sid, sid);
+    int n = swprintf(sddl, 384, L"O:%lsD:P(A;%ls;GA;;;%ls)(A;%ls;GA;;;SY)", sid, inherit, sid, inherit);
     LocalFree(sid);
     if (n < 0 || !ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1,
                                                                       descriptor, NULL)) return -1;
@@ -529,7 +533,7 @@ BOOL eco_private_owner(HANDLE handle, BOOL check_permissions) {
 static HANDLE local_instance(const wchar_t *name, BOOL first) {
     SECURITY_ATTRIBUTES security;
     PSECURITY_DESCRIPTOR descriptor;
-    if (eco_pipe_security(&security, &descriptor) < 0) return INVALID_HANDLE_VALUE;
+    if (eco_private_security(&security, &descriptor, FALSE) < 0) return INVALID_HANDLE_VALUE;
     HANDLE pipe = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
                                   (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
@@ -637,7 +641,7 @@ int eco_spawn_pipe(BOOL host_reads, int *host_fd, HANDLE *child) {
                  InterlockedIncrement(&sequence)) < 0) return -1;
     SECURITY_ATTRIBUTES security;
     PSECURITY_DESCRIPTOR descriptor;
-    if (eco_pipe_security(&security, &descriptor) < 0) return -1;
+    if (eco_private_security(&security, &descriptor, FALSE) < 0) return -1;
     HANDLE host = CreateNamedPipeW(name, (host_reads ? PIPE_ACCESS_INBOUND : PIPE_ACCESS_OUTBOUND) |
                                    FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,

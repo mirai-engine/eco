@@ -256,7 +256,10 @@ The current implementation uses bounded copies in the framing and retransmission
 The Windows backend targets x64 Windows 10 version 1809 or newer, including Windows 11.
 Named Pipes use IOCP for asynchronous reads, writes and accepts. Winsock notifications wake
 the same completion loop. Windows uses ConPTY for terminal sessions and Job Objects to
-cancel process trees. Project-relative native file operations reject NTFS reparse points.
+cancel process trees. A process created with `CREATE_BREAKAWAY_FROM_JOB`, such as a detached
+server or editor that a command starts, leaves the tree and outlives the command; the client
+daemon and job workers break away from a job that Eco itself runs in when that job allows it.
+Project-relative native file operations reject NTFS reparse points.
 Windows rejects execution grants scoped to a subdirectory. Landlock confinement is Linux-only.
 
 ### Build and run on Windows
@@ -280,7 +283,8 @@ Both builds produce `bin/eco.exe`. On Windows, the default IPC endpoint is
 different local pipe name, such as `\\.\pipe\eco-work`. Set `ECO_ADDR` and
 `ECO_KEY`, and pair, as on Unix. Key generation creates a private ACL.
 The job directory must be on NTFS and owned by the launching user with an ACL scoped to
-that user and trusted system administrators.
+that user and trusted system administrators. Eco creates `ECO_HOME/jobs` and the namespace of
+each client inside the job directory with an ACL of that user and SYSTEM that the jobs inherit.
 
 ```powershell
 .\bin\eco.exe run -- cmd.exe /d /c ver

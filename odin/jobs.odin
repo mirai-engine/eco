@@ -41,10 +41,11 @@ ensure_job_namespace :: proc(server: ^Server, link: ^Link) -> string {
     } else {
         directory = fmt.aprintf("%s/%s", server.jobs, string(name))
     }
-    _ = os.mkdir(directory, {.Read_User, .Write_User, .Execute_User})
+    // Created private rather than inheriting: on Windows a plain mkdir under a directory without
+    // inheritable entries gets the token's default DACL, which the privacy check rejects.
     cdir := strings.clone_to_cstring(directory)
     defer delete(cdir)
-    if eco_check_private_dir(cdir) != 1 {
+    if eco_ensure_private_dir(cdir) != 1 {
         delete(directory)
         return ""
     }

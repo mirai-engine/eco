@@ -154,6 +154,64 @@ def test_tunnels(env):
     print("TCP half-close and UDP tunnel passed", flush=True)
 
 
+def test_http_tunnel(env):
+    """Concurrent keep-alive request/response connections, as an HTTP JSON-RPC client makes."""
+    body = os.urandom(300_000)
+    with socket.socket() as target:
+        target.bind(("127.0.0.1", 0))
+        target.listen(32)
+        target.settimeout(10)
+        closed = []
+
+        def serve(conn):
+            with conn:
+                conn.settimeout(10)
+                pending = b""
+                while True:
+                    while b"\r\n\r\n" not in pending:
+                        block = conn.recv(65536)
+                        if not block:
+                            closed.append(True)  # The client's close reached the target.
+                            return
+                        pending += block
+                    request, pending = pending.split(b"\r\n\r\n", 1)
+                    conn.sendall(b"%d\r\n" % len(request) + request + body)
+
+        def accept_all(count):
+            for _ in range(count):
+                conn, _ = target.accept()
+                threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+        clients, rounds = 8, 2
+        acceptor = threading.Thread(target=accept_all, args=(clients * rounds,), daemon=True)
+        acceptor.start()
+
+        def session(index, port):
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as local:
+                for request in range(3):
+                    query = b"POST /rpc %d %d" % (index, request)
+                    local.sendall(query + b"\r\n\r\n")
+                    header = b""
+                    while not header.endswith(b"\r\n"):
+                        header += read_exact(local, 1)
+                    echoed = read_exact(local, int(header))
+                    assert echoed == query and read_exact(local, len(body)) == body
+
+        local_port = port_for(socket.SOCK_STREAM)
+        with background("forward", endpoint(local_port), endpoint(target.getsockname()[1]), env=env) as tunnel:
+            assert b"forwarding" in tunnel.stderr.readline()
+            for round_ in range(rounds):  # A second round reconnects after every relay closed.
+                with ThreadPoolExecutor(max_workers=clients) as pool:
+                    list(pool.map(session, range(clients), [local_port] * clients))
+            acceptor.join(10)
+            deadline = time.monotonic() + 5
+            while len(closed) < clients * rounds and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert len(closed) == clients * rounds, len(closed)
+            assert tunnel.poll() is None
+    print("concurrent keep-alive TCP tunnel passed", flush=True)
+
+
 class Fault_Proxy:
     def __init__(self, port, forward_response=None):
         self.target = ("127.0.0.1", port)
@@ -451,6 +509,7 @@ def main():
             test_terminal(env)
             test_run_output(env)
             test_tunnels(env)
+            test_http_tunnel(env)
             test_faults(base, port, client_secret, server_key, env)
             test_stream_liveness(base, root, port, client_secret, server_key, env)
             test_capabilities(base, root, server_secret, server_key, client_secret, client_key, env)
