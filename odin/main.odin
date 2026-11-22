@@ -29,13 +29,15 @@ USAGE :: `usage: eco COMMAND
   get REMOTE LOCAL
   write REMOTE                       read bytes from stdin
   put LOCAL REMOTE
-  run [--stdin|--no-stdin] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
-  start [--id HEX] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
+  run [--stdin|--no-stdin] [--sh] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
+                                     --sh runs PROGRAM as a script of the server's POSIX
+                                     shell with ARGs as $1...: /bin/sh, or Git Bash on Windows
+  start [--id HEX] [--sh] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
   attach ID [STDOUT_OFFSET STDERR_OFFSET] | jobs | kill ID
   desktop capture | stream [FPS]     write a JPEG or a stream of JPEGs
   desktop click X Y [left|right] | move X Y | type TEXT | key CODE | scroll DX DY
   forward|forward-udp LISTEN TARGET
-  tty [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
+  tty [--sh] [--cwd DIR] [--timeout-ms N] -- PROGRAM [ARG...]
 
 Client environment: ECO_SOCKET, ECO_ADDR, ECO_KEY, ECO_HOME and, unless pair
 stored the server for ECO_ADDR in the ECO_HOME/servers trust store, ECO_PEER.
@@ -210,8 +212,14 @@ run_payload :: proc(args: []string, buf: []byte, tty, default_stdin: bool, rows,
     timeout := 60*60*1000
     cwd := "."
     with_input := tty || default_stdin
+    shell := false
     i := 0
     for i < len(args) && args[i] != "--" {
+        if args[i] == "--sh" {
+            shell = true
+            i += 1
+            continue
+        }
         if args[i] == "--stdin" && !tty {
             with_input = true
             i += 1
@@ -238,7 +246,7 @@ run_payload :: proc(args: []string, buf: []byte, tty, default_stdin: bool, rows,
     if i+1 >= len(args) || cwd == "" || args[i+1] == "" { return nil, USAGE }
     if len(args)-i-1 > 64 { return nil, "a command accepts at most 64 arguments including the executable" }
     put_u32(buf, u32(timeout))
-    buf[4] = 1 if with_input else 0
+    buf[4] = (RUN_STDIN if with_input else 0) | (RUN_SHELL if shell else 0)
     encode_size(buf[5:9], rows, cols)
     n := 9
     if len(cwd)+1 > len(buf)-n { return nil, COMMAND_SIZE_ERROR }
@@ -330,7 +338,7 @@ command_cli :: proc(args: []string) -> int {
         copy(command_data, job_data[:JOB_ID])
         run, error := run_payload(rest, command_data[JOB_ID:], false, false, 0, 0)
         if error != "" { return error_exit(error) }
-        if run[4] != 0 { return error_exit("background jobs require a command without stdin") }
+        if run[4] & RUN_STDIN != 0 { return error_exit("background jobs require a command without stdin") }
         payload, op = command_data[:JOB_ID+len(run)], .Start
     case "attach", "kill":
         attaching := command == "attach"
@@ -413,7 +421,7 @@ command_cli :: proc(args: []string) -> int {
     if command_data != nil {
         if error := send_command(fd, op, payload); error != "" { return error_exit(error) }
     } else if !send_local(fd, op, payload) { return error_exit("cannot send local request") }
-    if (op == .Run || op == .Tty) && payload[4] == 1 {
+    if (op == .Run || op == .Tty) && payload[4] & RUN_STDIN != 0 {
         return run_interactive(fd, op == .Tty, term_rows, term_cols)
     }
 

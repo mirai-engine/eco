@@ -184,6 +184,10 @@ def main():
                 run = cli("run", "--cwd", ".", "--", "/bin/sh", "-c",
                           "printf out; printf err >&2; exit 7", env=env, check=False)
                 assert (run.returncode, run.stdout, run.stderr) == (7, b"out", b"err")
+                run = cli("run", "--sh", "--cwd", ".", "--", 'printf "%s|" "$0" "$@"; cat; exit 3',
+                          "a b", "'q'", "*", data=b"in", env=env, check=False)
+                assert (run.returncode, run.stdout) == (3, b"sh|a b|'q'|*|in"), run
+                assert cli("run", "--sh", "--", 'printf %s "$#"', *"x" * 63, env=env).stdout == b"63"
                 run = cli("run", "--timeout-ms", "70", "--", "/bin/sleep", "6", env=env, check=False)
                 assert run.returncode != 0 and b"timed out" in run.stderr
                 assert cli("run", "--", "/usr/bin/true", env=env).returncode == 0

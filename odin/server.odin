@@ -18,6 +18,14 @@ Op :: enum u8 {
 
 Access :: enum { Read, Write, Run, Tunnel }
 
+// Flags of a command request.
+RUN_STDIN :: 1
+// The first argument is a script for the POSIX shell, the rest its positional parameters.
+RUN_SHELL :: 2
+SHELL_PATH_MAX :: 1024
+SHELL_MISSING :: "Git Bash is required on Windows: install Git for Windows " +
+                 "(https://git-scm.com/download/win) and keep git.exe on PATH"
+
 Server :: struct {
     udp: net.UDP_Socket,
     own: ecdh.Private_Key,
@@ -183,7 +191,7 @@ start_process :: proc(root: c.int, call: ^Server_Call, data: []byte, confined :=
     rows := u16(data[5]) | u16(data[6]) << 8
     cols := u16(data[7]) | u16(data[8]) << 8
     tty := call.op == .Tty
-    if flags > 1 || (tty && (rows == 0 || cols == 0 || flags != 1)) {
+    if flags > RUN_STDIN|RUN_SHELL || (tty && (rows == 0 || cols == 0 || flags & RUN_STDIN == 0)) {
         return "invalid terminal options"
     }
     body := data[9:]
@@ -203,24 +211,37 @@ start_process :: proc(root: c.int, call: ^Server_Call, data: []byte, confined :=
     }
     defer _ = eco_close(dir)
 
-    args: [65]cstring
+    words: [65]cstring
     // NUL termini are already present in the wire buffer.
     offset := cwd_end+1
     count := 0
     for offset < len(body) {
-        if count == len(args)-1 || (count == 0 && body[offset] == 0) {
+        if count == len(words)-1 || (count == 0 && body[offset] == 0) {
             return "invalid executable or too many arguments"
         }
-        args[count] = cstring(&body[offset])
+        words[count] = cstring(&body[offset])
         count += 1
         offset += strings.index_byte(string(body[offset:]), 0)+1
+    }
+    // The shell, -c, a script, $0 and up to 64 words, then the terminator.
+    shell_args: [69]cstring
+    shell_path: [SHELL_PATH_MAX]byte
+    encoded: []byte
+    defer delete(encoded)
+    args := words[:]
+    if flags & RUN_SHELL != 0 {
+        if eco_posix_shell(&shell_path[0], SHELL_PATH_MAX) <= 0 { return SHELL_MISSING }
+        ok: bool
+        encoded, ok = shell_arguments(shell_args[:], cstring(&shell_path[0]), words[:count])
+        if !ok { return "out of memory" }
+        args = shell_args[:]
     }
     scope := root if confined else -1
     if confined && eco_scope_supported() != 1 { return "OS cannot enforce the execution scope" }
     if tty {
         call.pid = eco_spawn_pty(raw_data(args[:]), &call.output[0], dir, rows, cols, scope)
     } else {
-        input := &call.input if flags == 1 else nil
+        input := &call.input if flags & RUN_STDIN != 0 else nil
         call.pid = eco_spawn(raw_data(args[:]), raw_data(call.output[:]), dir, input, scope)
     }
     if call.pid < 0 {
@@ -631,6 +652,8 @@ serve :: proc(endpoint: net.Endpoint, own: ^ecdh.Private_Key, clients: string,
     fd := eco_root(root_c)
     if fd < 0 { return error_exit("cannot open the server root") }
     defer _ = eco_close(fd)
+    shell_path: [SHELL_PATH_MAX]byte
+    if access == .Run && eco_posix_shell(&shell_path[0], SHELL_PATH_MAX) <= 0 { return error_exit(SHELL_MISSING) }
     udp, err := net.make_bound_udp_socket(endpoint.address, endpoint.port)
     if err != nil { return error_exit("cannot listen on UDP", err) }
     udp_fd := eco_socket_fd(uintptr(udp))

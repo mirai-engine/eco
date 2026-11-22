@@ -377,3 +377,41 @@ int eco_bulk_thread(EcoWork work, void *data, int socket_fd) {
     }
     return id;
 }
+
+static BOOL git_bash(wchar_t path[MAX_PATH], const wchar_t *base, const wchar_t *tail) {
+    size_t length = wcslen(base), extra = wcslen(tail);
+    if (!length || length + extra >= MAX_PATH) return FALSE;
+    wmemcpy(path, base, length);
+    wmemcpy(path + length, tail, extra + 1);
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Git Bash's bin\bash.exe puts the Git tools on PATH. A bare bash.exe on PATH can be the WSL one
+// in System32, so the search starts from git.exe, which lives in Git\cmd, Git\bin or
+// Git\mingw64\bin, and then tries the machine and per-user install folders.
+int eco_posix_shell(char *buffer, int capacity) {
+    wchar_t path[MAX_PATH], git[MAX_PATH];
+    BOOL found = FALSE;
+    DWORD size = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    wchar_t *search = size ? malloc(size * sizeof(wchar_t)) : NULL;
+    DWORD length = search && GetEnvironmentVariableW(L"PATH", search, size) == size - 1
+        ? SearchPathW(search, L"git.exe", NULL, MAX_PATH, git, NULL) : 0;
+    free(search);
+    for (int up = 0; length && length < MAX_PATH && !found && up < 3; ++up) {
+        wchar_t *slash = wcsrchr(git, L'\\');
+        if (!slash) break;
+        *slash = 0;
+        found = up && git_bash(path, git, L"\\bin\\bash.exe");
+    }
+    static const wchar_t *const variables[] = {L"ProgramW6432", L"ProgramFiles", L"LOCALAPPDATA"};
+    static const wchar_t *const folders[] = {L"\\Git\\bin\\bash.exe", L"\\Git\\bin\\bash.exe",
+                                             L"\\Programs\\Git\\bin\\bash.exe"};
+    for (int i = 0; !found && i < 3; ++i) {
+        length = GetEnvironmentVariableW(variables[i], git, MAX_PATH);
+        found = length && length < MAX_PATH && git_bash(path, git, folders[i]);
+    }
+    if (!found) return -1;
+    int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, -1, buffer, capacity, NULL, NULL);
+    return written > 0 ? written - 1 : -1;
+}

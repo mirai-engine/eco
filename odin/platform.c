@@ -717,3 +717,10 @@ int eco_bulk_worker(int socket, int scope) {
     closedir(open_fds);
     return 0;
 }
+
+int eco_posix_shell(char *buffer, int capacity) {
+    static const char shell[] = "/bin/sh";
+    if (capacity < (int)sizeof shell) return -1;
+    memcpy(buffer, shell, sizeof shell);
+    return (int)sizeof shell - 1;
+}

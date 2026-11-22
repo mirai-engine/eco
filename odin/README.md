@@ -11,7 +11,9 @@ interoperate.
 ## Build and pair
 
 The verified builds are macOS arm64 and Ubuntu 24.04 Linux arm64. Build with Odin containing
-`core:crypto/noise` and `core:crypto/aegis` (tested with `dev-2026-10`), a C toolchain and Git. The
+`core:crypto/noise` and `core:crypto/aegis` (tested with `dev-2026-10`; Windows builds need
+`dev-2026-11` or newer, whose `wmain` entry point delivers arguments as UTF-8), a C toolchain and
+Git. The
 script fetches pinned KCP and odin-blake3 sources. On Linux, `pkg-config` and liburing development
 headers enable the optional io_uring backend. All cryptography is Odin's; nothing links OpenSSL.
 
@@ -103,6 +105,7 @@ eco put ./local.bin target.bin
 eco get target.bin ./verified.bin
 eco run --cwd subdir -- git status --short
 eco run --stdin -- /usr/bin/cat
+eco run --sh --cwd subdir -- 'make -j8 && printf "%s\n" "$1"' done
 eco tty -- /bin/sh
 eco forward 127.0.0.1:8765 127.0.0.1:8765
 eco forward-udp 127.0.0.1:5354 127.0.0.1:5353
@@ -117,8 +120,11 @@ eco kill "$job"
 `run`, `tty` and `start` accept command arguments and a working directory totaling up to
 128 KiB of encoded request data. The remote operating system can impose a smaller limit.
 `run` automatically forwards piped or redirected stdin; pass `--stdin` to force forwarding or
-`--no-stdin` to close remote stdin immediately. A command's timeout includes draining
-its output. A responsive stream stays open even while a command produces no output.
+`--no-stdin` to close remote stdin immediately. `run`, `tty` and `start` start the program
+directly, without a shell. With `--sh`, the first word after `--` is a script for the server's
+POSIX shell and the rest are its positional parameters `$1`, `$2`...; `$0` is `sh`. The shell is
+`/bin/sh` on macOS and Linux and Git Bash on Windows, and it reads no profile.
+A command's timeout includes draining its output. A responsive stream stays open even while a command produces no output.
 Windows exit codes above 255 are printed in hexadecimal. On macOS and Linux
 the CLI returns 125 for those codes because the local process status has only eight bits.
 
@@ -278,7 +284,16 @@ Cross-compile on macOS or Linux with a matching LLVM-MinGW UCRT toolchain.
 ./odin/build-windows-cross.sh /absolute/path/to/llvm-mingw/bin
 ```
 
-Both builds produce `bin/eco.exe`. On Windows, the default IPC endpoint is
+Both builds produce `bin/eco.exe`. The cross build refuses an Odin whose Windows entry point is
+`main`, which receives arguments in the ANSI code page and mangles non-ASCII paths.
+
+ECO on Windows requires [Git for Windows](https://git-scm.com/download/win). `serve ... run`
+refuses to start without it, and `--sh` scripts run with its Git Bash (`Git\bin\bash.exe`, found
+from `git.exe` on `PATH` or in the machine or per-user install folder), never with WSL's
+`System32\bash.exe`. Git Bash parses its command line through the MSYS2 runtime, which expands
+wildcards and truncates long quoted words, so the server passes the script and its parameters as
+escaped words that a short prelude decodes; they arrive byte for byte. On Windows, the default IPC
+endpoint is
 `\\.\pipe\eco-<current-user-SID>`. For a second daemon, set `ECO_SOCKET` to a
 different local pipe name, such as `\\.\pipe\eco-work`. Set `ECO_ADDR` and
 `ECO_KEY`, and pair, as on Unix. Key generation creates a private ACL.
@@ -286,13 +301,18 @@ The job directory must be on NTFS and owned by the launching user with an ACL sc
 that user and trusted system administrators. Eco creates `ECO_HOME/jobs` and the namespace of
 each client inside the job directory with an ACL of that user and SYSTEM that the jobs inherit.
 
-```powershell
-.\bin\eco.exe run -- cmd.exe /d /c ver
-.\bin\eco.exe tty -- powershell.exe -NoLogo
+From any client, a single program runs directly and a sequence of commands runs as a Git Bash
+script, never through PowerShell or `cmd.exe` quoting:
+
+```sh
+eco run -- git.exe -C C:/src/project status --short
+eco run --sh -- 'cd C:/src/project && git pull --ff-only && ./build.sh'
+eco forward 127.0.0.1:7940 127.0.0.1:7940
 ```
 
 The Windows smoke suite runs on a native host. It exercises identity, IOCP IPC, binary I/O,
-ConPTY resize, reparse-point rejection, files over UDP and TCP, forwarding, reattaching to a
+ConPTY resize, reparse-point rejection, files over UDP and TCP, `--sh` scripts through Git Bash
+with hostile parameters, forwarding, reattaching to a
 detached job, and pairing through the approval dialog with denial, approval and revocation.
 
 ## Verify and measure

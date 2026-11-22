@@ -55,6 +55,7 @@ foreign platform {
     eco_child_kill :: proc(pid: c.int) ---
     eco_child_events :: proc() -> c.int ---
     eco_scope_supported :: proc() -> c.int ---
+    eco_posix_shell :: proc(buffer: [^]byte, capacity: c.int) -> c.int ---
     eco_ring_setup :: proc() -> c.int ---
     eco_ring_close :: proc() ---
 

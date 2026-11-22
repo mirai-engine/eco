@@ -63,7 +63,7 @@ def test_terminal(env):
     master, slave = pty.openpty()
     try:
         set_size(slave, 27, 93)
-        command = [BINARY, "tty", "--", "/bin/sh", "-c", "stty size; read line; stty size; printf 'seen:%s' \"$line\""]
+        command = [BINARY, "tty", "--sh", "--", "stty size; read line; stty size; printf 'seen:%s' \"$line\""]
         with subprocess.Popen(command, env=env, stdin=slave, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE) as terminal:
             try:
@@ -453,7 +453,7 @@ def test_bulk(base, root, server_secret, server_key, client_secret, client_key, 
 
 def test_jobs(stack, base, root, port, server_secret, client_secret, server_key, client_key, env):
     command = "printf one; sleep 2; printf two; printf err >&2; exit 7\n#" + "x" * 4096
-    argv = ("--", "/bin/sh", "-c", command)
+    argv = ("--sh", "--", command)
     job = cli("start", *argv, env=env).stdout.decode().strip()
     assert len(job) == 32 and cli("start", "--id", job, *argv, env=env).stdout.decode().strip() == job
     assert cli("start", "--id", job, "--", "/bin/echo", "different", env=env, check=False).returncode

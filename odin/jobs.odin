@@ -141,7 +141,7 @@ open_job :: proc(server: ^Server, stream: ^Stream, call: ^Server_Call, body: []b
 
     #partial switch call.op {
     case .Start:
-        if len(body) < 13 || body[4] != 0 {
+        if len(body) < 13 || body[4] & RUN_STDIN != 0 {
             fail_call(stream, call, "background jobs require a command without stdin")
             return
         }

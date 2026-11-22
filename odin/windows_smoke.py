@@ -377,6 +377,13 @@ def main():
                 large = run("run", "--", sys.executable, "-c",
                             "import sys;sys.stdout.buffer.write(sys.argv[1].encode())", argument, env=env)
                 assert large.stdout == argument.encode()
+                # --sh runs Git Bash, never WSL's System32 bash.exe, and its parameters arrive intact.
+                words = (argument, "*", "'q'", "a\\b", "a\\\\b\\", "x\r\ny", "{a,b}", "~", "")
+                script = run("run", "--sh", "--", 'printf "%s|" "$0" "$@"; command -v cygpath >/dev/null; cat; exit 3',
+                             *words, env=env, data="stdin-é".encode(), checked=False)
+                expected = "|".join(("sh", *words, "stdin-é")).encode()
+                assert (script.returncode, script.stdout) == (3, expected), (script.returncode, script.stdout[-300:])
+                assert run("run", "--sh", "--", 'printf %s "$#"', *"x" * 63, env=env).stdout == b"63"
                 status = 0xC0000005
                 for options in ((), ("--stdin",)):
                     result = run("run", *options, "--", sys.executable, "-c", "raise SystemExit(-1073741819)",
